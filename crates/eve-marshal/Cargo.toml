@@ -1,0 +1,9 @@
+[package]
+name = "eve-marshal"
+version = "0.1.0"
+description = "blue.marshal codec for the EVE Online 2.10/3913 (Red Moon Rising) client"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

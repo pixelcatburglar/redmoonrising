@@ -1,0 +1,246 @@
+//! State shared by every connection: who is in the game, which chat channels
+//! they have open, the solar-system ballparks, and a queue per connection for
+//! notifications other connections send it.
+//!
+//! One lock guards it all, so a change that touches several players (a ship
+//! leaving a system, a chat line) is seen by everyone in the same order. Nothing
+//! awaits while holding it: notifications are queued, not sent.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, MutexGuard};
+
+use eve_marshal::Value;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+use crate::ballpark::Park;
+
+/// A notification for one client: `event(*args)` on its side.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub event: &'static str,
+    /// The positional arguments, as a tuple.
+    pub args: Value,
+}
+
+/// Where one connected character is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Presence {
+    pub char_id: i64,
+    pub corp_id: i64,
+    pub solar_system_id: i64,
+    pub docked: bool,
+}
+
+struct Client {
+    tx: UnboundedSender<Notification>,
+    presence: Option<Presence>,
+}
+
+struct Channel {
+    /// The channel ID as the client knows it.
+    id: Value,
+    members: HashSet<i64>,
+}
+
+#[derive(Default)]
+pub struct WorldState {
+    clients: HashMap<i64, Client>,
+    /// Open chat channels, by `channel_key`.
+    channels: HashMap<String, Channel>,
+    /// Solar system -> its ballpark. Created when the first ship arrives.
+    pub parks: HashMap<i64, Park>,
+}
+
+#[derive(Default)]
+pub struct World {
+    state: Mutex<WorldState>,
+}
+
+impl World {
+    pub fn lock(&self) -> MutexGuard<'_, WorldState> {
+        self.state.lock().expect("world lock poisoned")
+    }
+}
+
+impl WorldState {
+    /// Registers a connection; notifications for it arrive on the receiver.
+    pub fn connect(&mut self, client_id: i64) -> UnboundedReceiver<Notification> {
+        let (tx, rx) = unbounded_channel();
+        self.clients.insert(client_id, Client { tx, presence: None });
+        rx
+    }
+
+    /// Forgets a connection and its chat memberships; returns each channel it
+    /// was in with the members left, for the caller to announce the departure.
+    pub fn disconnect(&mut self, client_id: i64) -> Vec<(Value, Vec<i64>)> {
+        self.clients.remove(&client_id);
+        let mut left = Vec::new();
+        for channel in self.channels.values_mut() {
+            if channel.members.remove(&client_id) {
+                left.push((channel.id.clone(), channel.members.iter().copied().collect()));
+            }
+        }
+        self.channels.retain(|_, c| !c.members.is_empty());
+        left
+    }
+
+    pub fn set_presence(&mut self, client_id: i64, presence: Option<Presence>) {
+        if let Some(c) = self.clients.get_mut(&client_id) {
+            c.presence = presence;
+        }
+    }
+
+
+    /// The connections playing `char_id` (at most one, in practice).
+    pub fn clients_of(&self, char_id: i64) -> Vec<i64> {
+        self.clients
+            .iter()
+            .filter(|(_, c)| c.presence.is_some_and(|p| p.char_id == char_id))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    pub fn is_online(&self, char_id: i64) -> bool {
+        self.clients.values().any(|c| c.presence.is_some_and(|p| p.char_id == char_id))
+    }
+
+    /// Characters per solar system: (in space, docked). Every occupied system has
+    /// an in-space entry, if only 0: the star map iterates that dict's keys alone.
+    pub fn counts(&self) -> (HashMap<i64, i64>, HashMap<i64, i64>) {
+        let (mut space, mut docked) = (HashMap::new(), HashMap::new());
+        for p in self.clients.values().filter_map(|c| c.presence) {
+            let in_space = space.entry(p.solar_system_id).or_insert(0);
+            if p.docked {
+                *docked.entry(p.solar_system_id).or_insert(0) += 1;
+            } else {
+                *in_space += 1;
+            }
+        }
+        (space, docked)
+    }
+
+    /// Clients whose character belongs to `corp_id`.
+    pub fn corp_members(&self, corp_id: i64) -> Vec<i64> {
+        self.clients
+            .iter()
+            .filter(|(_, c)| c.presence.is_some_and(|p| p.corp_id == corp_id))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Clients whose character is in space in `solar_system_id`.
+    pub fn in_space(&self, solar_system_id: i64) -> Vec<i64> {
+        self.clients
+            .iter()
+            .filter(|(_, c)| {
+                c.presence.is_some_and(|p| p.solar_system_id == solar_system_id && !p.docked)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Queues `event(*args)` for each of `clients`. A client that has gone away
+    /// is skipped.
+    pub fn notify(&self, clients: &[i64], event: &'static str, args: Value) {
+        for id in clients {
+            if let Some(c) = self.clients.get(id) {
+                let _ = c.tx.send(Notification { event, args: args.clone() });
+            }
+        }
+    }
+
+    /// Opens a chat channel for a client; returns everyone who has it open now.
+    pub fn join_channel(&mut self, channel_id: &Value, client_id: i64) -> Vec<i64> {
+        let channel = self
+            .channels
+            .entry(channel_key(channel_id))
+            .or_insert_with(|| Channel { id: channel_id.clone(), members: HashSet::new() });
+        channel.members.insert(client_id);
+        channel.members.iter().copied().collect()
+    }
+
+    /// Closes a chat channel for a client; returns who still has it open.
+    pub fn leave_channel(&mut self, channel_id: &Value, client_id: i64) -> Vec<i64> {
+        let key = channel_key(channel_id);
+        let Some(channel) = self.channels.get_mut(&key) else { return Vec::new() };
+        channel.members.remove(&client_id);
+        let rest = channel.members.iter().copied().collect();
+        if channel.members.is_empty() {
+            self.channels.remove(&key);
+        }
+        rest
+    }
+
+    /// Everyone who has a chat channel open.
+    pub fn channel_members(&self, channel_id: &Value) -> Vec<i64> {
+        self.channels
+            .get(&channel_key(channel_id))
+            .map(|c| c.members.iter().copied().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// A chat channel's identity as a map key. Channel IDs are ints for ordinary
+/// channels and tuples like `(('solarsystemid2', 30002780),)` for local chat.
+fn channel_key(channel_id: &Value) -> String {
+    format!("{channel_id:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn presence(char_id: i64, docked: bool) -> Option<Presence> {
+        Some(Presence { char_id, corp_id: 1000044, solar_system_id: 30002780, docked })
+    }
+
+    #[test]
+    fn tracks_characters_until_they_leave() {
+        let world = World::default();
+        let mut w = world.lock();
+        let _a = w.connect(1);
+        let _b = w.connect(2);
+        w.set_presence(1, presence(140000001, true));
+        w.set_presence(2, presence(140000002, false));
+        assert!(w.is_online(140000001));
+        assert_eq!(w.in_space(30002780), vec![2]);
+        let (space, docked) = w.counts();
+        assert_eq!((space[&30002780], docked[&30002780]), (1, 1));
+
+        w.disconnect(2);
+        let (space, docked) = w.counts();
+        assert_eq!((space[&30002780], docked[&30002780]), (0, 1), "docked-only system still listed");
+
+        w.disconnect(1);
+        assert!(!w.is_online(140000001));
+        assert!(w.counts().0.is_empty());
+    }
+
+    #[test]
+    fn notifications_reach_only_the_named_clients() {
+        let world = World::default();
+        let mut w = world.lock();
+        let mut a = w.connect(1);
+        let mut b = w.connect(2);
+        w.notify(&[2], "OnTest", Value::Tuple(vec![Value::Int(7)]));
+        assert!(a.try_recv().is_err());
+        let n = b.try_recv().expect("queued for client 2");
+        assert_eq!(n.event, "OnTest");
+    }
+
+    #[test]
+    fn channel_membership_follows_joins_leaves_and_disconnects() {
+        let world = World::default();
+        let mut w = world.lock();
+        let _a = w.connect(1);
+        let _b = w.connect(2);
+        let channel = Value::Int(2000000000);
+        w.join_channel(&channel, 1);
+        let mut members = w.join_channel(&channel, 2);
+        members.sort();
+        assert_eq!(members, vec![1, 2]);
+        assert_eq!(w.leave_channel(&channel, 1), vec![2]);
+        assert_eq!(w.disconnect(2), vec![(channel.clone(), Vec::new())]);
+        assert!(w.channel_members(&channel).is_empty());
+    }
+}

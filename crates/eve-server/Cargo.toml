@@ -1,0 +1,21 @@
+[package]
+name = "eve-server"
+version = "0.1.0"
+description = "machoNet server for the EVE 2.10/3913 client: LLV handshake through authentication"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+default-run = "eve-server"
+
+[dependencies]
+eve-marshal = { path = "../eve-marshal" }
+eve-proto = { path = "../eve-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
+tokio-postgres = "0.7"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
+
+[target.'cfg(windows)'.dependencies]
+nu-ansi-term = "0.50"

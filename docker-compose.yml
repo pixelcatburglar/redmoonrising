@@ -1,0 +1,40 @@
+name: rmr
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rmr-postgres
+    environment:
+      POSTGRES_USER: rmr
+      POSTGRES_PASSWORD: rmr
+      POSTGRES_DB: rmr
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Over TCP: during the first-start import postgres only listens on its socket.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "rmr", "-d", "rmr"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5m
+
+  server:
+    build: .
+    image: rmr-server
+    container_name: rmr-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RMR_DATABASE: postgres://rmr:rmr@postgres:5432/rmr
+    ports:
+      - "26000:26000"
+    init: true
+    restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -1,0 +1,11 @@
+[package]
+name = "eve-proto"
+version = "0.1.0"
+description = "machoNet framing, addressing and packets for the EVE 2.10/3913 client"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-marshal = { path = "../eve-marshal" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
