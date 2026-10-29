@@ -85,6 +85,9 @@ pub enum Role {
     Charge { module: usize },
     Skill,
     Implant,
+    /// One of the character's drones in space: its skills reach it, its
+    /// ship's fitting does not.
+    Drone,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +204,19 @@ impl<'c> Loadout<'c> {
         ship_id: Option<i64>,
         active: &HashSet<i64>,
     ) -> Result<Loadout<'c>, tokio_postgres::Error> {
+        Self::load_with_drones(db, catalog, char_id, ship_id, active, &[]).await
+    }
+
+    /// As [`Loadout::load`], with some of the character's drones as well.
+    pub async fn load_with_drones(
+        db: &impl GenericClient,
+        catalog: &'c Catalog,
+        char_id: i64,
+        ship_id: Option<i64>,
+        active: &HashSet<i64>,
+        drones: &[i64],
+    ) -> Result<Loadout<'c>, tokio_postgres::Error> {
+        let drone_ids: Vec<i32> = drones.iter().map(|d| *d as i32).collect();
         let rows = db
             .query(
                 r#"SELECT e."itemID", e."typeID", t."groupID", g."categoryID", e."flag", e."locationID"
@@ -210,6 +226,7 @@ impl<'c> Loadout<'c> {
                     WHERE e."itemID" = $1 OR e."itemID" = $2
                        OR (e."locationID" = $1 AND e."flag" IN ($3, $4, $5, $6))
                        OR (e."locationID" = $2 AND (e."flag" BETWEEN $7 AND $8 OR e."flag" BETWEEN $9 AND $10))
+                       OR e."itemID" = ANY($11)
                     ORDER BY e."itemID""#,
                 &[
                     &(char_id as i32),
@@ -222,6 +239,7 @@ impl<'c> Loadout<'c> {
                     &(FLAG_SLOT_LAST as i32),
                     &(FLAG_RIG_FIRST as i32),
                     &(FLAG_RIG_LAST as i32),
+                    &drone_ids,
                 ],
             )
             .await?;
@@ -236,6 +254,8 @@ impl<'c> Loadout<'c> {
                 Role::Ship
             } else if category_id == category::SKILL {
                 Role::Skill
+            } else if drones.contains(&item_id) {
+                Role::Drone
             } else if r.get::<_, i32>(5) as i64 == char_id {
                 Role::Implant
             } else if category_id == category::CHARGE {
@@ -378,6 +398,25 @@ impl<'c> Loadout<'c> {
         self.pieces.iter().position(|p| p.item_id == item_id)
     }
 
+    pub fn ship(&self) -> Option<usize> {
+        self.index_of(Role::Ship)
+    }
+
+    pub fn character(&self) -> Option<usize> {
+        self.index_of(Role::Character)
+    }
+
+    /// The charge loaded in module `i`.
+    pub fn charge_of(&self, i: usize) -> Option<usize> {
+        self.pieces.iter().position(|p| p.role == Role::Charge { module: i })
+    }
+
+    /// Whether piece `i`'s type (or the item itself) has attribute `a`, rather
+    /// than falling back to the attribute's default.
+    pub fn has(&self, i: usize, a: i32) -> bool {
+        self.pieces[i].base.contains_key(&a)
+    }
+
     /// Whether a modifier of `category` from piece `i` applies right now.
     fn applies(&self, i: usize, m: &Modifier) -> bool {
         let p = &self.pieces[i];
@@ -413,6 +452,14 @@ impl<'c> Loadout<'c> {
             .filter(|(_, p)| matches!(p.role, Role::Module | Role::Charge { .. }))
             .map(|(i, _)| i)
             .collect();
+        // What the character's skills reach by owner: the fitting and its drones.
+        let owned: Vec<usize> = self
+            .pieces
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(p.role, Role::Module | Role::Charge { .. } | Role::Drone))
+            .map(|(i, _)| i)
+            .collect();
 
         for (i, p) in self.pieces.iter().enumerate() {
             for m in self.modifiers.iter().filter(|m| m.type_id == p.type_id) {
@@ -440,7 +487,7 @@ impl<'c> Loadout<'c> {
                     }
                     Func::LocationRequiredSkill | Func::OwnerRequiredSkill => {
                         let skill = m.skill_type_id.unwrap_or(-1);
-                        let scope: &[usize] = if m.func == Func::OwnerRequiredSkill { &on_ship } else { located };
+                        let scope: &[usize] = if m.func == Func::OwnerRequiredSkill { &owned } else { located };
                         scope.iter().copied().filter(|&t| self.pieces[t].required_skills().any(|s| s == skill)).collect()
                     }
                 };
@@ -551,7 +598,7 @@ impl<'c> Loadout<'c> {
 
 /// Multiply `factors` together, the n-th furthest from 1 (counted separately
 /// for bonuses and penalties) weighted by exp(-(n/2.67)^2).
-fn stacking_penalised(factors: &[f64]) -> f64 {
+pub fn stacking_penalised(factors: &[f64]) -> f64 {
     let mut total = 1.0;
     for side in [true, false] {
         let mut group: Vec<f64> = factors.iter().copied().filter(|f| (*f > 1.0) == side && *f != 1.0).collect();

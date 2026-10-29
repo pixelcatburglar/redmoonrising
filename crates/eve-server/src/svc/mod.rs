@@ -13,12 +13,14 @@ pub mod dogma;
 pub mod factory;
 pub mod fitting;
 pub mod gang;
+pub mod inflight;
 pub mod insurance;
 pub mod inventory;
 pub mod language;
 pub mod login;
 pub mod machonet;
 pub mod lookup;
+pub mod medical;
 pub mod map;
 pub mod market;
 pub mod missions;
@@ -71,6 +73,7 @@ pub fn registry() -> Registry {
         // items and ships
         .add_bound("invbroker", handler!(inventory::invbroker))
         .add("invcontainer", handler!(inventory::invcontainer))
+        .add_bound("dogmaIM", handler!(inflight::dogma_im))
         .add_bound("dogmaIM", handler!(dogma::dogma_im))
         .add("factory", handler!(factory::factory))
         .add("ramProxy", handler!(ram::ram_proxy))
@@ -79,6 +82,8 @@ pub fn registry() -> Registry {
         .add_bound("ship", handler!(space::ship))
         .add_bound("insuranceSvc", handler!(insurance::insurance_svc))
         .add_bound("beyonce", handler!(space::beyonce))
+        .add_bound("entity", handler!(crate::drones::entity))
+        .add_bound("aggressionMgr", handler!(crate::concord::aggression_mgr))
         // money and market
         .add("account", handler!(wallet::account))
         .add("billMgr", handler!(wallet::bill_mgr))

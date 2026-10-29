@@ -51,16 +51,17 @@ pub fn is_fitting_flag(flag: i64) -> bool {
     flag == FLAG_AUTO_FIT || is_slot(flag)
 }
 
-/// Put `item` (a module or a charge) into `ship` at `flag`.
-pub async fn fit(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, ship: &Item, item: &Item, flag: i64) -> Result<(), MoveError> {
-    if ctx.session.station_id.is_none() {
+/// Put `item` (a module, or up to `quantity` of a charge) into `ship` at `flag`.
+pub async fn fit(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, ship: &Item, item: &Item, flag: i64, quantity: Option<i64>) -> Result<(), MoveError> {
+    // Reloading works anywhere; changing modules needs a station.
+    if ctx.session.station_id.is_none() && item.category_id != category::CHARGE {
         return refuse("Ships can only be refitted while docked.");
     }
     if Some(ship.id) != ctx.session.ship_id {
         return refuse("You can only fit your active ship.");
     }
     match item.category_id {
-        category::CHARGE => load_charge(ctx, txn, ship, item, flag).await,
+        category::CHARGE => load_charge(ctx, txn, ship, item, flag, quantity.unwrap_or(item.quantity)).await,
         category::MODULE => fit_module(ctx, txn, ship, item, flag).await,
         _ => refuse("Only modules and charges can be fitted."),
     }
@@ -183,8 +184,9 @@ async fn set_online_attr(txn: &ItemTxn<'_>, item_id: i64, on: bool) -> Result<()
     Ok(())
 }
 
-/// Load a charge into the module at `flag`, up to what the module holds.
-async fn load_charge(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, ship: &Item, charge: &Item, flag: i64) -> Result<(), MoveError> {
+/// Load up to `wanted` of a charge into the module at `flag`, as far as the
+/// module holds.
+async fn load_charge(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, ship: &Item, charge: &Item, flag: i64, wanted: i64) -> Result<(), MoveError> {
     let char_id = ctx.session.char_id.unwrap_or(0);
     let loadout = Loadout::load(txn.tx(), ctx.dogma, char_id, Some(ship.id), &HashSet::new()).await?;
     let Some(module) = loadout.pieces.iter().position(|p| p.category_id == category::MODULE && p.flag == flag) else {
@@ -217,7 +219,7 @@ async fn load_charge(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, ship: &Item, charge: 
         Some(l) => txn.item(l.item_id).await?.map_or(0, |i| i.quantity),
         None => 0,
     };
-    let quantity = charge.quantity.min(room - have);
+    let quantity = wanted.clamp(1, charge.quantity).min(room - have);
     if quantity <= 0 {
         return refuse("That module is already full.");
     }
@@ -260,6 +262,11 @@ async fn type_attribute(txn: &ItemTxn<'_>, type_id: i64, attribute: i32) -> Resu
 /// A module leaving its slot goes offline and takes its charge with it.
 pub async fn unfit(txn: &mut ItemTxn<'_>, module: &Item, location: i64, flag: i64) -> Result<(), MoveError> {
     set_online_attr(txn, module.id, false).await?;
+    unload(txn, module.location_id, module.flag, location, flag).await
+}
+
+/// Move the charges in `ship`'s slot `slot` to `location` at `flag`.
+pub async fn unload(txn: &mut ItemTxn<'_>, ship_id: i64, slot: i64, location: i64, flag: i64) -> Result<(), MoveError> {
     let charges = txn
         .tx()
         .query(
@@ -267,7 +274,7 @@ pub async fn unfit(txn: &mut ItemTxn<'_>, module: &Item, location: i64, flag: i6
                  JOIN "invTypes" t ON t."typeID" = e."typeID"
                  JOIN "invGroups" g ON g."groupID" = t."groupID"
                 WHERE e."locationID" = $1 AND e."flag" = $2 AND g."categoryID" = $3"#,
-            &[&(module.location_id as i32), &(module.flag as i32), &(category::CHARGE as i32)],
+            &[&(ship_id as i32), &(slot as i32), &(category::CHARGE as i32)],
         )
         .await?;
     for r in &charges {

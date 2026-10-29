@@ -9,11 +9,12 @@ use eve_proto::MachoPacket;
 use tracing::{error, info, warn};
 
 use super::{Conn, Result};
-use crate::ballpark::{Command, Ship, Vec3};
+use crate::ballpark::{Command, Vec3};
 use crate::destiny;
 use crate::exceptions::{custom_error, user_error};
 use crate::svc::inventory::FLAG_HANGAR;
-use crate::svc::{bound, space};
+use crate::svc::{bound, inflight, space};
+use crate::world::Move;
 
 /// const.maxStargateJumpingDistance.
 const JUMP_RANGE: f64 = 2_500.0;
@@ -98,18 +99,19 @@ impl Conn {
             return self.send_error(req, err).await;
         };
 
+        let char_id = self.session.char_id.unwrap_or(0);
         let (loaded, exit) = {
             let ctx = self.ctx();
             space::ensure_park(&ctx, system_id).await;
-            (space::load_ship(&ctx, ship_id).await, space::undock_point(&ctx, station_id).await)
+            (inflight::ship_for_space(&ctx, char_id, ship_id).await, space::undock_point(&ctx, station_id).await)
         };
-        let (Some((stats, pilot)), Some((pos, heading))) = (loaded, exit) else {
+        let (Some(mut ship), Some((pos, heading))) = (loaded, exit) else {
             error!("cannot undock ship {ship_id} from {station_id}: ship or station data missing");
             return self.send_error(req, custom_error("Your ship could not be undocked.")).await;
         };
         // Out of the bay at full speed, coasting to a stop clear of the station.
-        let push = heading * stats.max_velocity;
-        let ship = Ship::new(ship_id, self.client_id, stats, pilot, pos, push);
+        ship.pos = pos;
+        ship.vel = heading * ship.stats.max_velocity;
 
         let before = self.session.clone();
         self.session.station_id = None;
@@ -220,7 +222,7 @@ impl Conn {
         }
 
         // Towed in: out of space, into the station.
-        let (start, end) = {
+        let (start, end, ship) = {
             let mut world = self.server.world.lock();
             let start = world
                 .parks
@@ -228,9 +230,16 @@ impl Conn {
                 .and_then(|p| p.ships.get(&ship_id))
                 .map_or(Vec3::ZERO, |s| s.pos);
             let end = world.parks.get(&system_id).and_then(|p| p.ball(station_id)).map_or(start, |(p, _)| p);
-            space::remove_ship(&mut world, system_id, ship_id);
-            (start, end)
+            (start, end, space::remove_ship(&mut world, system_id, ship_id))
         };
+        // Destroyed on the way in.
+        let Some(ship) = ship else {
+            warn!("dock at {station_id}: ship {ship_id} is no longer in space");
+            return self.send_error(req, denied("Your ship is no longer in space.")).await;
+        };
+        if let Some(fight) = &ship.fight {
+            inflight::save_vitals(&self.server.db, ship_id, fight, true).await;
+        }
         let point = |v: Vec3| Value::Tuple(vec![Value::Double(v.x), Value::Double(v.y), Value::Double(v.z)]);
         let accepted = Value::Tuple(vec![point(start), point(end), Value::Int(station_id)]);
         self.server.world.lock().notify(&[self.client_id], "OnDockingAccepted", accepted);
@@ -306,8 +315,20 @@ impl Conn {
         self.session.region_id = Some(jump.region_id);
         self.send_session_change_from(&before).await?;
 
-        // Arrive: out of the destination gate, standing still.
+        // Arrive: out of the destination gate, standing still, with whatever
+        // the modules that just stopped did to the ship undone.
         if let Some(mut ship) = ship {
+            if ship.fight.as_ref().is_some_and(|f| !f.applied.is_empty()) {
+                let now = crate::combat::now_ms();
+                let char_id = self.session.char_id.unwrap_or(0);
+                let nothing = Default::default();
+                let fresh = inflight::profile(&self.server.db, &self.server.dogma, char_id, ship_id, &nothing, now);
+                match fresh.await {
+                    Ok(Some(p)) => inflight::apply_profile(&mut ship, p, now),
+                    Ok(None) => {}
+                    Err(e) => error!("refreshing ship {ship_id} after the jump: {}", crate::logging::chain(&e)),
+                }
+            }
             ship.pos = jump.arrival;
             ship.vel = Vec3::ZERO;
             ship.command = Command::Stop;
@@ -327,6 +348,29 @@ impl Conn {
             jump.solar_system_id
         );
         self.reply(req, &Value::None).await
+    }
+
+    /// A session move the world decided on: the ship blew up, or the capsule did.
+    pub(super) async fn forced_move(&mut self, m: Move) -> Result {
+        let before = self.session.clone();
+        match m {
+            Move::ShipLost { ship_id } => {
+                self.session.ship_id = Some(ship_id);
+                self.send_session_change_from(&before).await?;
+                info!("ship destroyed; ejected in capsule {ship_id}");
+            }
+            Move::Podded { station_id, solar_system_id, constellation_id, region_id, ship_id } => {
+                self.session.station_id = Some(station_id);
+                self.session.solar_system_id = None;
+                self.session.solar_system_id2 = Some(solar_system_id);
+                self.session.constellation_id = Some(constellation_id);
+                self.session.region_id = Some(region_id);
+                self.session.ship_id = ship_id;
+                self.send_session_change_from(&before).await?;
+                info!(ship = ?ship_id, "capsule destroyed; woke up in a clone at station {station_id}");
+            }
+        }
+        Ok(())
     }
 
     /// Record a dock: the ship goes into the station hangar, the pilot into the

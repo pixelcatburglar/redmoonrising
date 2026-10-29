@@ -1,6 +1,6 @@
 use eve_marshal::Value;
 use tokio_postgres::Row as PgRow;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::services::{Call, Ctx, Outcome};
 use crate::svc::rows::{row, rowset};
@@ -58,7 +58,7 @@ pub async fn character(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "GetCharacterDescription" => character_description(ctx, subject(call, ctx)).await,
         "SetCharacterDescription" => set_character_description(call, ctx).await,
         "GetCloneTypeID" => clone_type_id(ctx).await,
-        "GetHomeStation" => home_station(ctx),
+        "GetHomeStation" => crate::svc::medical::get_home_station(ctx).await,
         _ => return None,
     };
     Some(Outcome::Value(value))
@@ -309,16 +309,6 @@ async fn set_character_description(call: &Call, ctx: &Ctx<'_>) -> Value {
         error!("character.SetCharacterDescription({char_id}): {err}", err = crate::logging::chain(&e));
     }
     Value::None
-}
-
-fn home_station(ctx: &Ctx<'_>) -> Value {
-    match ctx.session.hq_id.or(ctx.session.station_id) {
-        Some(id) => Value::Int(id),
-        None => {
-            warn!("character.GetHomeStation: no hqID or stationID in session");
-            Value::None
-        }
-    }
 }
 
 async fn clone_type_id(ctx: &Ctx<'_>) -> Value {

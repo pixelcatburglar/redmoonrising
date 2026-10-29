@@ -1,6 +1,6 @@
 //! State shared by every connection: who is in the game, which chat channels
 //! they have open, the solar-system ballparks, and a queue per connection for
-//! notifications other connections send it.
+//! notifications (and session moves) the rest of the server sends it.
 //!
 //! One lock guards it all, so a change that touches several players (a ship
 //! leaving a system, a chat line) is seen by everyone in the same order. Nothing
@@ -22,6 +22,25 @@ pub struct Notification {
     pub args: Value,
 }
 
+/// Something that happened to a character which its connection has to carry
+/// into its session, because the client did not ask for it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Move {
+    /// The ship was destroyed; the pilot is now in `ship_id`, a capsule, in
+    /// the same system.
+    ShipLost { ship_id: i64 },
+    /// The capsule was destroyed; the pilot wakes in a clone at a station, in a
+    /// new capsule if one could be made.
+    Podded { station_id: i64, solar_system_id: i64, constellation_id: i64, region_id: i64, ship_id: Option<i64> },
+}
+
+/// What a connection's queue carries, in the order it was queued.
+#[derive(Debug, Clone)]
+pub enum Push {
+    Notify(Notification),
+    Move(Move),
+}
+
 /// Where one connected character is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Presence {
@@ -32,7 +51,7 @@ pub struct Presence {
 }
 
 struct Client {
-    tx: UnboundedSender<Notification>,
+    tx: UnboundedSender<Push>,
     presence: Option<Presence>,
 }
 
@@ -64,7 +83,7 @@ impl World {
 
 impl WorldState {
     /// Registers a connection; notifications for it arrive on the receiver.
-    pub fn connect(&mut self, client_id: i64) -> UnboundedReceiver<Notification> {
+    pub fn connect(&mut self, client_id: i64) -> UnboundedReceiver<Push> {
         let (tx, rx) = unbounded_channel();
         self.clients.insert(client_id, Client { tx, presence: None });
         rx
@@ -144,8 +163,15 @@ impl WorldState {
     pub fn notify(&self, clients: &[i64], event: &'static str, args: Value) {
         for id in clients {
             if let Some(c) = self.clients.get(id) {
-                let _ = c.tx.send(Notification { event, args: args.clone() });
+                let _ = c.tx.send(Push::Notify(Notification { event, args: args.clone() }));
             }
+        }
+    }
+
+    /// Queues a session move for one client, after anything already queued.
+    pub fn push_move(&self, client_id: i64, m: Move) {
+        if let Some(c) = self.clients.get(&client_id) {
+            let _ = c.tx.send(Push::Move(m));
         }
     }
 
@@ -224,7 +250,7 @@ mod tests {
         let mut b = w.connect(2);
         w.notify(&[2], "OnTest", Value::Tuple(vec![Value::Int(7)]));
         assert!(a.try_recv().is_err());
-        let n = b.try_recv().expect("queued for client 2");
+        let Push::Notify(n) = b.try_recv().expect("queued for client 2") else { panic!("a notification") };
         assert_eq!(n.event, "OnTest");
     }
 

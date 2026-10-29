@@ -1,13 +1,21 @@
 mod ballpark;
 mod bulkdata;
+mod combat;
+mod concord;
 mod config;
 mod conn;
 mod db;
 mod destiny;
+mod drones;
 mod dogma;
 mod exceptions;
+mod fight;
+mod heartbeat;
 mod items;
 mod logging;
+mod losses;
+mod loot;
+mod npc;
 mod services;
 mod session;
 mod svc;
@@ -79,6 +87,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         world: world::World::default(),
         dump_dir: config.dump_dir.clone(),
     });
+    tokio::spawn(heartbeat::run(Arc::clone(&server)));
     let listener = TcpListener::bind(&config.bind).await?;
     info!("listening on {} as node {}", config.bind, config.node_id);
 

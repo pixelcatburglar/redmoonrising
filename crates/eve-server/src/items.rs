@@ -115,6 +115,36 @@ impl<'c> ItemTxn<'c> {
         Ok(())
     }
 
+    pub async fn set_owner(&mut self, id: i64, owner_id: i64) -> DbResult<()> {
+        self.touch(id).await?;
+        self.tx
+            .execute(r#"UPDATE entity SET "ownerID" = $2 WHERE "itemID" = $1"#, &[&(id as i32), &(owner_id as i32)])
+            .await?;
+        Ok(())
+    }
+
+    /// Where an item floats in space (not compared on commit: the client
+    /// learns positions from destiny).
+    pub async fn set_position(&mut self, id: i64, pos: (f64, f64, f64)) -> DbResult<()> {
+        self.tx
+            .execute(r#"UPDATE entity SET "x" = $2, "y" = $3, "z" = $4 WHERE "itemID" = $1"#, &[&(id as i32), &pos.0, &pos.1, &pos.2])
+            .await?;
+        Ok(())
+    }
+
+    /// Where every item touched so far was before this transaction.
+    pub fn origins(&self) -> Vec<i64> {
+        let mut out: Vec<i64> = self
+            .before
+            .values()
+            .flatten()
+            .filter_map(|cells| cells.get(IX_LOCATION_ID as usize).and_then(|v| v.as_i64()))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     pub async fn set_singleton(&mut self, id: i64, singleton: bool) -> DbResult<()> {
         self.touch(id).await?;
         self.tx

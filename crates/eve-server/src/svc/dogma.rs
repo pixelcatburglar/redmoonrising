@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use eve_marshal::Value;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use crate::services::{Call, Ctx, Outcome};
 use crate::svc::rows::{index_rowset, line, row};
@@ -32,18 +32,7 @@ async fn method_call(ctx: &Ctx<'_>, method: &str, args: &[Value]) -> Outcome {
 
         "CheckSendLocationInfo" => Outcome::Value(Value::None),
 
-        "Activate" => activate(ctx, args, true).await,
-        "Deactivate" => activate(ctx, args, false).await,
-
-        "AddTarget" => {
-            let target = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
-            Outcome::Value(Value::Tuple(vec![
-                Value::Int(0),
-                Value::List(vec![Value::Int(target)]),
-            ]))
-        }
-        "RemoveTarget" | "ClearTargets" => Outcome::Value(Value::None),
-        "GetTargets" | "GetTargeters" => Outcome::Value(Value::List(Vec::new())),
+        // Targeting and module activation are `inflight`'s.
         "LogAttribute" => Outcome::Value(Value::List(Vec::new())),
 
         _ => Outcome::Unknown(format!("{SERVICE}::{method}")),
@@ -246,7 +235,25 @@ async fn computed_attributes(ctx: &Ctx<'_>, item_ids: &[i64]) -> BTreeMap<i64, B
     if !rest.is_empty() {
         out.extend(attributes_for(ctx, &rest).await);
     }
+    live_vitals(ctx, &mut out);
     out
+}
+
+/// In space, the ship's hit points and capacitor are the fight's, not the
+/// database's.
+fn live_vitals(ctx: &Ctx<'_>, attrs: &mut BTreeMap<i64, BTreeMap<i32, f64>>) {
+    use crate::combat::attr;
+    let (Some(system), Some(ship_id)) = (ctx.session.solar_system_id, ctx.session.ship_id) else { return };
+    let Some(own) = attrs.get_mut(&ship_id) else { return };
+    let world = ctx.world.lock();
+    let Some(fight) = world.parks.get(&system).and_then(|p| p.ships.get(&ship_id)).and_then(|s| s.fight.as_ref()) else {
+        return;
+    };
+    let now = crate::combat::now_ms();
+    own.insert(attr::SHIELD_CHARGE, fight.vitals.shield.at(now));
+    own.insert(attr::CHARGE, fight.vitals.capacitor.at(now));
+    own.insert(attr::ARMOR_DAMAGE, fight.vitals.armor_damage);
+    own.insert(attr::DAMAGE, fight.vitals.hull_damage);
 }
 
 async fn attributes_for(
@@ -344,26 +351,6 @@ fn active_effects(item: &Item, own: Option<&BTreeMap<i32, f64>>) -> Value {
     d.push(Value::Int(0));
     d.push(Value::None);
     Value::Dict(vec![(Value::Int(EFFECT_ONLINE), Value::List(d))])
-}
-
-/// Activate/Deactivate(itemID, effectName, ...): "online" puts a module on- or
-/// offline; other effects are not modelled yet.
-async fn activate(ctx: &Ctx<'_>, args: &[Value], on: bool) -> Outcome {
-    let item_id = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
-    let effect = args.get(1);
-    let is_online = match effect {
-        Some(Value::Bytes(b)) | Some(Value::Buffer(b)) => b.as_slice() == b"online",
-        Some(v) => v.as_i64() == Some(EFFECT_ONLINE),
-        None => false,
-    };
-    if !is_online {
-        info!(
-            "{} {item_id} effect {effect:?}: no effect model, accepted and ignored",
-            if on { "Activate" } else { "Deactivate" }
-        );
-        return Outcome::Value(Value::None);
-    }
-    crate::svc::fitting::set_online(ctx, item_id, on).await
 }
 
 #[cfg(test)]

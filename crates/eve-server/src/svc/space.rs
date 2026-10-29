@@ -9,7 +9,7 @@
 use eve_marshal::Value;
 use tracing::{debug, warn};
 
-use crate::ballpark::{Celestial, Command, Park, Pilot, Ship, ShipStats, Vec3};
+use crate::ballpark::{Celestial, Command, Park, Ship, Vec3};
 use crate::destiny::{self, flags, mode, Ball};
 use crate::services::{Call, Ctx, Outcome};
 use crate::svc::rows::{float, int, key_val, rowset, text};
@@ -36,6 +36,18 @@ pub async fn ship(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             let ids = call.args.first().and_then(|v| v.seq()).unwrap_or(&[]);
             let ids = ids.iter().filter_map(|v| v.as_i64()).collect();
             Some(crate::svc::moves::assemble_ship(ctx, ids).await)
+        }
+        // Drop(itemIDs, ownerID=None, ignoreWarning=False): launch drones, one per
+        // ID listed (a stack of five is listed five times).
+        "Drop" => {
+            let ids = call.args.first().and_then(|v| v.seq()).unwrap_or(&[]);
+            let ids: Vec<i64> = ids.iter().filter_map(|v| v.as_i64()).collect();
+            Some(crate::drones::launch(ctx, ids).await)
+        }
+        "ScoopDrone" => {
+            let ids = call.args.first().and_then(|v| v.seq()).unwrap_or(&[]);
+            let ids: Vec<i64> = ids.iter().filter_map(|v| v.as_i64()).collect();
+            Some(crate::drones::scoop(ctx, ids).await)
         }
         _ => None,
     }
@@ -76,11 +88,29 @@ pub async fn ensure_park(ctx: &Ctx<'_>, solar_system_id: i64) {
         return;
     }
     let celestials = load_celestials(ctx, solar_system_id).await;
+    let now = crate::combat::now_ms();
+    if let Err(e) = crate::loot::ensure_table(ctx.db).await {
+        warn!("no loot table: {}", crate::logging::chain(&e));
+    }
+    let cans = crate::loot::load_cans(ctx.db, solar_system_id, now).await.unwrap_or_else(|e| {
+        warn!("cans in {solar_system_id} not loaded: {}", crate::logging::chain(&e));
+        Vec::new()
+    });
+    let wildlife = match crate::npc::load(ctx.db, solar_system_id).await {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("system {solar_system_id} gets no belt life: {}", crate::logging::chain(&e));
+            Default::default()
+        }
+    };
     let mut world = ctx.world.lock();
-    world
-        .parks
-        .entry(solar_system_id)
-        .or_insert_with(|| Park::new(solar_system_id, celestials, destiny::tick_now()));
+    world.parks.entry(solar_system_id).or_insert_with(|| {
+        let mut park = Park::new(solar_system_id, celestials, destiny::tick_now());
+        park.wildlife = std::sync::Arc::new(wildlife);
+        crate::npc::populate(&mut park);
+        park.cans = cans.into_iter().map(|c| (c.id, c)).collect();
+        park
+    });
 }
 
 async fn load_celestials(ctx: &Ctx<'_>, solar_system_id: i64) -> Vec<Celestial> {
@@ -107,40 +137,6 @@ async fn load_celestials(ctx: &Ctx<'_>, solar_system_id: i64) -> Vec<Celestial> 
             },
         })
         .collect()
-}
-
-/// The ship's flight characteristics and its pilot, from its type and character.
-pub async fn load_ship(ctx: &Ctx<'_>, ship_id: i64) -> Option<(ShipStats, Pilot)> {
-    let sql = r#"
-        SELECT e."typeID", COALESCE(NULLIF(e."itemName", ''), t."typeName"),
-               COALESCE(t."radius", 0), COALESCE(t."mass", 0),
-               COALESCE((SELECT COALESCE(a."valueFloat", a."valueInt") FROM "dgmTypeAttributes" a
-                          WHERE a."typeID" = e."typeID" AND a."attributeID" = 70), 1),
-               COALESCE((SELECT COALESCE(a."valueFloat", a."valueInt") FROM "dgmTypeAttributes" a
-                          WHERE a."typeID" = e."typeID" AND a."attributeID" = 37), 0),
-               COALESCE((SELECT COALESCE(a."valueFloat", a."valueInt") FROM "dgmTypeAttributes" a
-                          WHERE a."typeID" = e."typeID" AND a."attributeID" = 600), 1),
-               c."characterID", c."corporationID", co."allianceID",
-               COALESCE(c."securityRating", 0), COALESCE(c."bounty", 0)
-          FROM entity e
-          JOIN "invTypes" t ON t."typeID" = e."typeID"
-          LEFT JOIN "character_" c ON c."characterID" = $2
-          LEFT JOIN corporation co ON co."corporationID" = c."corporationID"
-         WHERE e."itemID" = $1"#;
-    let char_id = ctx.session.char_id.unwrap_or(0) as i32;
-    let r = ctx.query_one(sql, &[&(ship_id as i32), &char_id]).await?;
-    let f = |i: usize| float(&r, i).unwrap_or(0.0);
-    let stats = ShipStats::new(f(2), f(3), f(4), f(5), f(6));
-    let pilot = Pilot {
-        type_id: int(&r, 0).unwrap_or(0),
-        name: text(&r, 1).unwrap_or_default(),
-        char_id: int(&r, 7).unwrap_or(0),
-        corp_id: int(&r, 8).unwrap_or(0),
-        alliance_id: int(&r, 9).filter(|a| *a != 0),
-        security: f(10),
-        bounty: f(11),
-    };
-    Some((stats, pilot))
 }
 
 // ---- what the client is sent --------------------------------------------------
@@ -172,7 +168,7 @@ fn ship_ball(ship: &Ship) -> Ball {
         mode: mode::STOP,
         radius: ship.stats.radius,
         pos: ship.pos.tuple(),
-        flags: flags::SHIP,
+        flags: if ship.in_warp() { flags::SHIP_IN_WARP } else { flags::SHIP },
         mass: ship.stats.mass,
         corp_id: ship.pilot.corp_id as i32,
         alliance_id: ship.pilot.alliance_id.unwrap_or(-1) as i32,
@@ -184,7 +180,7 @@ fn ship_ball(ship: &Ship) -> Ball {
     }
 }
 
-fn slim(fields: Vec<(&str, Value)>) -> Value {
+pub fn slim(fields: Vec<(&str, Value)>) -> Value {
     Value::Instance {
         class: Box::new(Value::bytes("foo.SlimItem")),
         state: Box::new(Value::Dict(fields.into_iter().map(|(k, v)| (Value::bytes(k), v)).collect())),
@@ -194,6 +190,24 @@ fn slim(fields: Vec<(&str, Value)>) -> Value {
 /// groupID/categoryID are left out on purpose: the client derives them from typeID.
 fn ship_slim(ship: &Ship) -> Value {
     let p = &ship.pilot;
+    // An NPC belongs to its corporation and has no pilot to show.
+    if ship.npc.is_some() {
+        return slim(vec![
+            ("itemID", Value::Int(ship.id)),
+            ("typeID", Value::Int(p.type_id)),
+            ("ownerID", Value::Int(p.corp_id)),
+            ("corpID", Value::Int(p.corp_id)),
+        ]);
+    }
+    // A drone belongs to its pilot but is not flown by one.
+    if ship.drone.is_some() {
+        return slim(vec![
+            ("itemID", Value::Int(ship.id)),
+            ("typeID", Value::Int(p.type_id)),
+            ("ownerID", Value::Int(p.char_id)),
+            ("corpID", Value::Int(p.corp_id)),
+        ]);
+    }
     slim(vec![
         ("itemID", Value::Int(ship.id)),
         ("typeID", Value::Int(p.type_id)),
@@ -224,17 +238,20 @@ fn celestial_slim(c: &Celestial, owners: &[(i64, i64)]) -> Value {
     slim(fields)
 }
 
-/// [shield (fraction, tau), armor, structure]; everything is undamaged.
-fn full_health() -> Value {
-    Value::List(vec![
-        Value::Tuple(vec![Value::Double(1.0), Value::Double(1.0)]),
-        Value::Double(1.0),
-        Value::Double(1.0),
-    ])
+/// [shield (fraction, tau), armor, structure], as the ship is now.
+fn health(ship: &Ship) -> Value {
+    match &ship.fight {
+        Some(f) => crate::fight::damage_state(&f.vitals, crate::combat::now_ms()),
+        None => Value::List(vec![
+            Value::Tuple(vec![Value::Double(1.0), Value::Double(1.0)]),
+            Value::Double(1.0),
+            Value::Double(1.0),
+        ]),
+    }
 }
 
 /// The destiny opcode for a ship's current command.
-fn command_entry(ship: &Ship, tick: i64) -> Value {
+pub fn command_entry(ship: &Ship, tick: i64) -> Value {
     let id = Value::Int(ship.id);
     let point = |p: &Vec3| vec![id.clone(), Value::Double(p.x), Value::Double(p.y), Value::Double(p.z)];
     match &ship.command {
@@ -247,9 +264,12 @@ fn command_entry(ship: &Ship, tick: i64) -> Value {
         Command::Orbit { target, range } => {
             entry(tick, "Orbit", vec![id, Value::Int(*target), Value::Double(*range)])
         }
+        // WarpTo(ballID, x, y, z, range, warpFactor): without the factor
+        // destiny warps everyone at 2 AU/s.
         Command::Warp { target, range } => {
             let mut args = point(target);
             args.push(Value::Double(*range));
+            args.push(Value::Int(ship.stats.warp_factor));
             entry(tick, "WarpTo", args)
         }
     }
@@ -257,7 +277,7 @@ fn command_entry(ship: &Ship, tick: i64) -> Value {
 
 /// The opcodes that put a ship back on its current course, for a client that
 /// has just been given the ship standing still.
-fn course_entries(ship: &Ship, tick: i64) -> Vec<Value> {
+pub fn course_entries(ship: &Ship, tick: i64) -> Vec<Value> {
     if ship.command == Command::Stop {
         return Vec::new();
     }
@@ -272,14 +292,22 @@ pub fn set_state_entries(park: &Park, ego: i64, station_owners: &[(i64, i64)]) -
     let mut balls: Vec<Ball> = park
         .celestials
         .iter()
-        .map(|c| Ball::celestial(c.id, c.radius, c.pos.tuple(), &c.name))
+        .map(|c| Ball::celestial(c.id, c.radius, c.pos.tuple(), &c.name, c.massive()))
         .collect();
     let mut slims: Vec<Value> = park.celestials.iter().map(|c| celestial_slim(c, station_owners)).collect();
+    for rock in park.rocks.values() {
+        balls.push(Ball::celestial(rock.id, rock.radius, rock.pos.tuple(), &rock.name, true));
+        slims.push(crate::npc::rock_slim(rock));
+    }
+    for can in park.cans.values() {
+        balls.push(Ball::celestial(can.id, can.radius, can.pos.tuple(), &can.name, false));
+        slims.push(crate::loot::slim(can));
+    }
     let mut damage = Vec::new();
     for ship in park.ships.values() {
         balls.push(ship_ball(ship));
         slims.push(ship_slim(ship));
-        damage.push((Value::Int(ship.id), full_health()));
+        damage.push((Value::Int(ship.id), health(ship)));
     }
     let bag = key_val(vec![
         ("state", Value::Bytes(destiny::encode(destiny::stamp(park.tick), &balls))),
@@ -293,8 +321,8 @@ pub fn set_state_entries(park: &Park, ego: i64, station_owners: &[(i64, i64)]) -
                 ("ownerID", Value::Int(OWNER_SYSTEM)),
             ]),
         ),
-        ("aggressors", Value::Dict(Vec::new())),
-        ("droneState", rowset(DRONE_HEADER, Vec::new())),
+        ("aggressors", park.watch.aggressors()),
+        ("droneState", rowset(DRONE_HEADER, crate::drones::state_lines(park))),
         ("gangCorps", Value::List(Vec::new())),
         ("charGangs", Value::List(Vec::new())),
         ("damageState", Value::Dict(damage)),
@@ -314,7 +342,7 @@ pub fn add_ball_entries(park: &Park, ship_id: i64) -> Vec<Value> {
     let chunk = Value::Tuple(vec![
         Value::Bytes(blob),
         Value::List(vec![ship_slim(ship)]),
-        Value::Dict(vec![(Value::Int(ship.id), full_health())]),
+        Value::Dict(vec![(Value::Int(ship.id), health(ship))]),
     ]);
     let mut entries = vec![entry(park.tick, "AddBalls", vec![chunk])];
     entries.extend(course_entries(ship, park.tick));
@@ -369,12 +397,17 @@ pub fn add_ship(world: &mut WorldState, system: i64, ship: Ship) {
     world.notify(&others, "DoDestinyUpdate", args);
 }
 
-/// Takes a ship out of its system's park and out of everyone's view; returns it.
+/// Takes a ship out of its system's park, out of everyone's view and out of
+/// every fight it was in; returns it.
 pub fn remove_ship(world: &mut WorldState, system: i64, ship_id: i64) -> Option<Ship> {
     let park = world.parks.get_mut(&system)?;
     park.advance(destiny::tick_now());
-    let ship = park.ships.remove(&ship_id)?;
+    let mut out = crate::heartbeat::Out::default();
+    let now = crate::combat::now_ms();
+    crate::fight::stand_down(park, ship_id, now, &mut out);
+    let ship = crate::fight::detach(park, ship_id, now, &mut out)?;
     let entries = remove_ball_entries(park.tick, ship_id);
+    out.deliver(world);
     let others: Vec<i64> = world.in_space(system).into_iter().filter(|c| *c != ship.client_id).collect();
     let args = Value::Tuple(vec![Value::List(entries), Value::Int(0)]);
     world.notify(&others, "DoDestinyUpdate", args);
@@ -457,6 +490,12 @@ async fn movement(ctx: &Ctx<'_>, call: &Call) -> Outcome {
         }
         // destiny ignores course changes mid-warp; so does the server.
         Some(ship) if ship.in_warp() => return Outcome::Value(Value::None),
+        Some(ship)
+            if matches!(order, Order::Command(Command::Warp { .. }))
+                && ship.fight.as_ref().is_some_and(|f| f.afflictions.scrambled >= 1.0) =>
+        {
+            return Outcome::UserError { msg: "WarpScrambled".into(), args: Vec::new() };
+        }
         Some(_) => {}
     }
     let (entries, what) = match order {
@@ -467,8 +506,16 @@ async fn movement(ctx: &Ctx<'_>, call: &Call) -> Outcome {
         }
         Order::Command(command) => {
             let what = format!("{command:?}");
+            let mut entries = Vec::new();
+            // destiny aligns at the throttle's speed and only warps above
+            // 75% of the top one, so a warp opens it.
+            if matches!(command, Command::Warp { .. }) && park.ships[&ship_id].speed_fraction < 1.0 {
+                park.set_speed_fraction(ship_id, 1.0);
+                entries.push(entry(tick, "SetSpeedFraction", vec![Value::Int(ship_id), Value::Double(1.0)]));
+            }
             park.command(ship_id, command);
-            (vec![command_entry(&park.ships[&ship_id], tick)], what)
+            entries.insert(0, command_entry(&park.ships[&ship_id], tick));
+            (entries, what)
         }
     };
     debug!("ship {ship_id}: {what}");
@@ -509,6 +556,9 @@ async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<Vec3> {
     };
     match kind {
         "item" => {
+            if let Some(point) = warp_in_point(ctx, id) {
+                return Some(point);
+            }
             let sql = r#"SELECT "x","y","z" FROM "mapDenormalize" WHERE "itemID" = $1"#;
             point(&ctx.query_one(sql, &[&(id as i32)]).await?, 0)
         }
@@ -532,6 +582,21 @@ async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<Vec3> {
             None
         }
     }
+}
+
+/// Where a warp to something in the park aims. A ship or can: where it is
+/// now. A massive celestial: the point of its surface facing the ship, so
+/// that the warp's range is counted from the surface and nobody lands inside
+/// a planet (which destiny would throw them out of).
+fn warp_in_point(ctx: &Ctx<'_>, id: i64) -> Option<Vec3> {
+    let world = ctx.world.lock();
+    let park = world.parks.get(&ctx.session.solar_system_id?)?;
+    if let Some(pos) = park.ships.get(&id).map(|s| s.pos).or_else(|| park.cans.get(&id).map(|c| c.pos)) {
+        return Some(pos);
+    }
+    let c = park.celestial(id).filter(|c| c.massive())?;
+    let from = park.ships.get(&ctx.session.ship_id?)?.pos;
+    Some(c.pos + (from - c.pos).unit() * c.radius)
 }
 
 // ---- jumps --------------------------------------------------------------------------
@@ -603,6 +668,7 @@ pub fn is_station(park: &Park, id: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ballpark::{Pilot, ShipStats};
 
     #[test]
     fn a_destiny_entry_is_stamp_then_opcode_then_args() {
@@ -619,6 +685,7 @@ mod tests {
         let stats = ShipStats::new(37.0, 1_100_000.0, 3.1, 320.0, 2.0);
         let pilot = Pilot {
             type_id: 587,
+            group_id: 25,
             name: "Rifter".into(),
             char_id: 140000001,
             corp_id: 1000002,

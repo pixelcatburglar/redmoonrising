@@ -26,8 +26,8 @@ use crate::bulkdata::BulkData;
 use crate::exceptions::{custom_error, service_not_found, user_error};
 use crate::services::{self, Call, Ctx, Outcome};
 use crate::session::Session;
-use crate::svc::{bound, chat, space};
-use crate::world::{Notification, Presence, World};
+use crate::svc::{bound, chat, inflight, space};
+use crate::world::{Notification, Presence, Push, World};
 
 /// State shared by every connection.
 pub struct Server {
@@ -114,7 +114,7 @@ impl Conn {
         .await
     }
 
-    async fn serve(&mut self, mut notifications: UnboundedReceiver<Notification>) -> Result {
+    async fn serve(&mut self, mut notifications: UnboundedReceiver<Push>) -> Result {
         self.handshake().await?;
         loop {
             // Both branches are cancellation-safe: a read that loses the race has
@@ -124,8 +124,11 @@ impl Conn {
                     Some(frame) => frame,
                     None => return Ok(()),
                 },
-                Some(n) = notifications.recv() => {
-                    self.send_notification(&n).await?;
+                Some(push) = notifications.recv() => {
+                    match push {
+                        Push::Notify(n) => self.send_notification(&n).await?,
+                        Push::Move(m) => self.forced_move(m).await?,
+                    }
                     continue;
                 }
             };
@@ -159,7 +162,11 @@ impl Conn {
         if let (Some(system), Some(ship_id), None) =
             (self.session.solar_system_id, self.session.ship_id, self.session.station_id)
         {
-            space::remove_ship(&mut world, system, ship_id);
+            // The pilot comes back docked, so the ship keeps only its damage.
+            if let Some(fight) = space::remove_ship(&mut world, system, ship_id).and_then(|s| s.fight) {
+                let server = Arc::clone(&self.server);
+                tokio::spawn(async move { inflight::save_vitals(&server.db, ship_id, &fight, true).await });
+            }
         }
         let who = chat::who(&self.session);
         for (channel, members) in channels {

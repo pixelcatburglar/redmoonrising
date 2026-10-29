@@ -111,12 +111,9 @@ pub async fn lsc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         // own mailbox (channelID = charID) this is how contacts are blocked.
         "AccessControl" => access_control(ctx, call).await,
 
-        "GetMessageDetails" | "Page" => {
-            return Some(Outcome::Unknown(format!(
-                "LSC::{} needs the evemailDetails body/attachment path (recon/10 §5.2-§5.3)",
-                call.method
-            )))
-        }
+        "GetMessageDetails" => message_details(ctx, call.arg_id(0), call.arg_id(1)).await,
+        // Page(destinations, subject, body, attachments=None) (newmessage.py:173).
+        "Page" => return Some(page(ctx, call).await),
 
         _ => return None,
     };
@@ -147,6 +144,123 @@ async fn get_my_messages(ctx: &Ctx<'_>) -> Value {
             rowset(HEADER, Vec::new())
         }
     }
+}
+
+/// Mail sent to a mailbox: a character, a corporation, an alliance, or a
+/// mailing list.
+async fn page(ctx: &Ctx<'_>, call: &Call) -> Outcome {
+    const SUBJECT_MAX: usize = 150;
+    const BODY_MAX: usize = 8_000;
+    let Some(sender) = ctx.session.char_id else { return Outcome::custom("No character.") };
+    let destinations: Vec<i64> = call.args.first().and_then(|v| v.seq()).unwrap_or(&[]).iter().filter_map(|v| v.as_i64()).collect();
+    let subject: String = call.arg_text(1).unwrap_or_default().chars().take(SUBJECT_MAX).collect();
+    let body: String = call.arg_text(2).unwrap_or_default().chars().take(BODY_MAX).collect();
+    if call.kwarg("attachments").is_some_and(|a| a.seq().is_some_and(|s| !s.is_empty())) {
+        warn!("LSC.Page: attachments are not stored; sending the text alone");
+    }
+    let ids: Vec<i32> = destinations.iter().filter_map(|id| i32::try_from(*id).ok()).collect();
+    let sql = r#"SELECT id FROM unnest($1::int[]) AS id
+                  WHERE EXISTS (SELECT 1 FROM "character_" WHERE "characterID" = id)
+                     OR EXISTS (SELECT 1 FROM corporation WHERE "corporationID" = id)
+                     OR EXISTS (SELECT 1 FROM alliances WHERE "allianceID" = id)
+                     OR EXISTS (SELECT 1 FROM channels WHERE "channelID" = id AND "mailingList" <> 0)"#;
+    let mailboxes: Vec<i64> = ctx.query(sql, &[&ids]).await.iter().map(|r| r.get::<_, i32>(0) as i64).collect();
+    if mailboxes.is_empty() {
+        return Outcome::custom("None of those can receive mail.");
+    }
+    match deliver(ctx.db, ctx.world, sender, &mailboxes, &subject, &body).await {
+        Ok(()) => {
+            tracing::info!("mail {subject:?} from {sender} to {mailboxes:?}");
+            Outcome::Value(Value::None)
+        }
+        Err(e) => {
+            error!("LSC.Page from {sender}: {}", crate::logging::chain(&e));
+            Outcome::custom("Your mail could not be sent.")
+        }
+    }
+}
+
+/// Puts a mail in each mailbox and tells whoever is online to look:
+/// OnMessage(recipients, messageID, senderID, subject, created) (inbox.py:405).
+pub async fn deliver(
+    db: &impl tokio_postgres::GenericClient,
+    world: &crate::world::World,
+    sender: i64,
+    mailboxes: &[i64],
+    subject: &str,
+    body: &str,
+) -> Result<(), tokio_postgres::Error> {
+    let created = crate::bulkdata::filetime_now();
+    for mailbox in mailboxes {
+        let message_id: i32 = db
+            .query_one(
+                r#"WITH m AS (
+                       INSERT INTO evemail ("channelID","senderID","subject","created","read")
+                       VALUES ($1, $2, $3, $4, 0) RETURNING "messageID"
+                   )
+                   INSERT INTO "evemailDetails" ("messageID","mimeTypeID","attachment")
+                   SELECT "messageID", 1, $5 FROM m RETURNING "messageID""#,
+                &[&(*mailbox as i32), &(sender as i32), &subject, &created, &body],
+            )
+            .await?
+            .get(0);
+        // Who reads this mailbox: a pilot, a corporation, or a list's members.
+        let readers: Vec<i64> = db
+            .query(
+                r#"SELECT $1::int UNION SELECT "charID" FROM "channelChars" WHERE "channelID" = $1 AND "charID" <> 0"#,
+                &[&(*mailbox as i32)],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get::<_, i32>(0) as i64)
+            .collect();
+        let w = world.lock();
+        let mut clients: Vec<i64> = readers.iter().flat_map(|r| w.clients_of(*r)).collect();
+        clients.extend(w.corp_members(*mailbox));
+        clients.sort_unstable();
+        clients.dedup();
+        let args = Value::Tuple(vec![
+            Value::List(vec![Value::Int(*mailbox)]),
+            Value::Int(message_id as i64),
+            Value::Int(sender),
+            Value::text(subject),
+            Value::Long(created),
+        ]);
+        w.notify(&clients, "OnMessage", args);
+    }
+    Ok(())
+}
+
+/// GetMessageDetails(channelID, messageID) -> (message, attachments): the
+/// message row with its text body, and any other attachments (inbox.py:669
+/// reads msg.body and each attachment's mimeType).
+async fn message_details(ctx: &Ctx<'_>, channel_id: i64, message_id: i64) -> Value {
+    const MESSAGE: &[&str] = &["channelID", "messageID", "senderID", "subject", "created", "read", "body"];
+    const ATTACHMENT: &[&str] = &["attachmentID", "messageID", "mimeType", "attachment"];
+    let mailboxes = own_entity_ids(ctx);
+    if !mailboxes.contains(&channel_id) {
+        return Value::None;
+    }
+    let sql = r#"SELECT "channelID","messageID","senderID","subject","created","read" FROM "evemail"
+                  WHERE "channelID" = $1 AND "messageID" = $2"#;
+    let Some(r) = ctx.query_one(sql, &[&(channel_id as i32), &(message_id as i32)]).await else { return Value::None };
+    let mut message = crate::svc::rows::line(&r);
+    let sql = r#"SELECT d."attachmentID", d."messageID", m."mimeType", d."attachment"
+                   FROM "evemailDetails" d JOIN "evemailMimeType" m ON m."mimeTypeID" = d."mimeTypeID"
+                  WHERE d."messageID" = $1 ORDER BY d."attachmentID""#;
+    let rows = ctx.query(sql, &[&(message_id as i32)]).await;
+    let mut body = Value::text("");
+    let mut attachments = Vec::new();
+    for r in &rows {
+        let mime: String = r.get(2);
+        if mime == "text/plain" && body == Value::text("") {
+            body = Value::text(r.get::<_, String>(3));
+        } else {
+            attachments.push(crate::svc::rows::row(ATTACHMENT, crate::svc::rows::line(r)));
+        }
+    }
+    message.push(body);
+    Value::Tuple(vec![crate::svc::rows::row(MESSAGE, message), Value::List(attachments)])
 }
 
 async fn mark_messages_read(ctx: &Ctx<'_>, arg: Option<&Value>) -> Value {

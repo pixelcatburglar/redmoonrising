@@ -1,6 +1,6 @@
 //! Moving items between containers: the invcontainer writes Add, MultiAdd,
-//! MergeItems, MultiMerge and StackAll (invCache.py:621-763), and
-//! ship.AssembleShip (menusvc.py:2452).
+//! MergeItems, MultiMerge and StackAll (invCache.py:621-763), ReplaceCharges
+//! (shipmodulebutton.py:311), and ship.AssembleShip (menusvc.py:2452).
 //!
 //! A character can reach its own items in the station it is docked in (on the
 //! hangar floor, or one or two containers deep) or, in space, in its ship.
@@ -66,6 +66,8 @@ pub async fn container_write(ctx: &Ctx<'_>, container: Container, call: &Call) -
         ),
         // StackAll(flag=None, securityCode=None)
         "StackAll" => Op::StackAll { flag: flag(0) },
+        // ReplaceCharges(flag, itemID, quantity): change ammo (shipmodulebutton.py:311).
+        "ReplaceCharges" => Op::ReplaceCharges { flag: flag(0), item: call.arg_id(1), quantity: call.arg_i64(2) },
         _ => return None,
     };
     Some(run(ctx, container, op).await)
@@ -81,6 +83,7 @@ enum Op {
     Add { items: Vec<i64>, quantity: Option<i64>, flag: Option<i64> },
     Merge(Vec<(i64, i64, Option<i64>)>),
     StackAll { flag: Option<i64> },
+    ReplaceCharges { flag: Option<i64>, item: i64, quantity: Option<i64> },
     Assemble(Vec<i64>),
 }
 
@@ -88,16 +91,24 @@ enum Op {
 async fn run(ctx: &Ctx<'_>, container: Container, op: Op) -> Outcome {
     // The loadout before any fitting change, to report what it did.
     let mut fitting_before: Option<Snapshot> = None;
-    let result: Result<Vec<Value>, MoveError> = async {
+    let result: Result<(Vec<Value>, Vec<i64>), MoveError> = async {
         let mut client = crate::db::connect(ctx.db_url).await?;
         let mut txn = ItemTxn::begin(&mut client).await?;
         apply(ctx, &mut txn, container, op, &mut fitting_before).await?;
-        Ok(txn.commit().await?)
+        let origins = txn.origins();
+        Ok((txn.commit().await?, origins))
     }
     .await;
     match result {
-        Ok(events) => {
+        Ok((events, origins)) => {
             items::notify(ctx.world, ctx.client_id, events);
+            // Taking from another pilot's can is theft; taking the last thing
+            // out of a can in space ends the can.
+            if let Some(system) = ctx.session.solar_system_id {
+                let corp_id = ctx.session.corp_id.unwrap_or(0);
+                crate::concord::took_from(ctx.db, ctx.world, system, me(ctx), corp_id, &origins).await;
+                crate::loot::clear_emptied(ctx.db, ctx.world, system, &origins).await;
+            }
             if let Some(before) = fitting_before {
                 fitting::push_attribute_changes(ctx, &before).await;
             }
@@ -162,6 +173,16 @@ async fn apply(
         Op::StackAll { flag } => {
             let dest = destination(ctx, txn, container, flag).await?;
             stack_all(ctx, txn, &dest, flag.is_some()).await?;
+        }
+        Op::ReplaceCharges { flag, item, quantity } => {
+            let dest = destination(ctx, txn, container, flag).await?;
+            let Some(ship) = &dest.fitting else { return refuse("Charges can only be loaded into a module.") };
+            if fitting_before.is_none() {
+                *fitting_before = Some(fitting::snapshot(txn.tx(), ctx.dogma, me(ctx), ctx.session.ship_id).await?);
+            }
+            // The old charges go back to the hold, then the new ones load as a reload would.
+            fitting::unload(txn, ship.id, dest.flag, ship.id, FLAG_CARGO).await?;
+            add(ctx, txn, &dest, item, quantity, fitting_before).await?;
         }
         Op::Assemble(ids) => assemble(ctx, txn, &ids).await?,
     }
@@ -276,8 +297,20 @@ async fn check_room(txn: &ItemTxn<'_>, dest: &Destination, item: &Item, quantity
     Ok(())
 }
 
-/// Whether the caller can take `item`: its own, and here.
+/// Whether `item` sits in a can floating within reach of the caller's ship.
+fn in_reachable_can(ctx: &Ctx<'_>, item: &Item) -> bool {
+    match (ctx.session.solar_system_id, ctx.session.ship_id) {
+        (Some(system), Some(ship)) => crate::loot::in_reach(ctx.world, system, ship, item.location_id),
+        _ => false,
+    }
+}
+
+/// Whether the caller can take `item`: its own, and here; or anything in a
+/// can it is close to.
 async fn reachable(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, item: &Item) -> DbResult<bool> {
+    if in_reachable_can(ctx, item) {
+        return Ok(true);
+    }
     if item.owner_id != me(ctx) {
         return Ok(false);
     }
@@ -336,7 +369,7 @@ async fn add(
         *fitting_before = Some(fitting::snapshot(txn.tx(), ctx.dogma, me(ctx), ctx.session.ship_id).await?);
     }
     if let Some(ship) = &dest.fitting {
-        return fitting::fit(ctx, txn, ship, &item, dest.flag).await;
+        return fitting::fit(ctx, txn, ship, &item, dest.flag, quantity).await;
     }
     if fitting::is_slot(item.flag) && item.category_id == category::MODULE {
         if ctx.session.station_id.is_none() {
@@ -346,12 +379,17 @@ async fn add(
     }
     let quantity = if item.singleton { 1 } else { quantity.unwrap_or(item.quantity).clamp(1, item.quantity) };
     check_room(txn, dest, &item, quantity).await?;
+    // Loot taken from a can becomes the taker's.
+    let owner = me(ctx);
     if quantity < item.quantity {
         txn.set_quantity(item.id, item.quantity - quantity).await?;
-        let new = NewItem { location_id: dest.location, flag: dest.flag, quantity, singleton: false, ..new_like(&item) };
+        let new = NewItem { location_id: dest.location, flag: dest.flag, quantity, singleton: false, owner_id: owner, ..new_like(&item) };
         txn.create(new).await?;
     } else {
         txn.move_to(item.id, dest.location, dest.flag).await?;
+        if item.owner_id != owner {
+            txn.set_owner(item.id, owner).await?;
+        }
     }
     Ok(())
 }

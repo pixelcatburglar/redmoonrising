@@ -40,7 +40,11 @@ pub mod flags {
     pub const HAS_MINIBALLS: u8 = 0x40;
 
     pub const SHIP: u8 = IS_FREE | IS_GLOBAL | IS_MASSIVE | IS_INTERACTIVE;
+    /// A ship in warp: destiny drops IS_MASSIVE for the warp (0x100186b0).
+    pub const SHIP_IN_WARP: u8 = SHIP & !IS_MASSIVE;
     pub const CELESTIAL: u8 = IS_GLOBAL | IS_MASSIVE | IS_INTERACTIVE;
+    /// Fixed, but ships pass through it: stations, cans.
+    pub const CELESTIAL_PASSABLE: u8 = CELESTIAL & !IS_MASSIVE;
 }
 
 const NO_FORMATION: u8 = 0xFF;
@@ -66,13 +70,14 @@ pub struct Ball {
 }
 
 impl Ball {
-    pub fn celestial(id: i64, radius: f64, pos: (f64, f64, f64), name: &str) -> Self {
+    /// A ball that never moves; `massive` if ships bounce off it.
+    pub fn celestial(id: i64, radius: f64, pos: (f64, f64, f64), name: &str, massive: bool) -> Self {
         Ball {
             id,
             mode: mode::RIGID,
             radius,
             pos,
-            flags: flags::CELESTIAL,
+            flags: if massive { flags::CELESTIAL } else { flags::CELESTIAL_PASSABLE },
             mass: 0.0,
             corp_id: -1,
             alliance_id: -1,
@@ -169,7 +174,7 @@ mod tests {
 
     #[test]
     fn a_rigid_ball_skips_both_conditional_blocks() {
-        let b = Ball::celestial(60_014_689, 27_072.0, (1.0, 2.0, 3.0), "AB");
+        let b = Ball::celestial(60_014_689, 27_072.0, (1.0, 2.0, 3.0), "AB", true);
         let blob = encode(0, &[b]);
         // header 4+1+32+1, formation 1, name 1+4
         assert_eq!(blob.len(), 5 + 38 + 1 + 5);
@@ -202,7 +207,7 @@ mod tests {
 
     #[test]
     fn the_name_is_utf16_counted_in_characters() {
-        let b = Ball::celestial(1, 0.0, (0.0, 0.0, 0.0), "Ab");
+        let b = Ball::celestial(1, 0.0, (0.0, 0.0, 0.0), "Ab", true);
         let blob = encode(0, &[b]);
         let tail = &blob[blob.len() - 5..];
         assert_eq!(tail, &[2, b'A', 0, b'b', 0]);
@@ -211,7 +216,7 @@ mod tests {
     #[test]
     fn an_overlong_name_is_truncated_not_wrapped() {
         let name = "z".repeat(400);
-        let b = Ball::celestial(1, 0.0, (0.0, 0.0, 0.0), &name);
+        let b = Ball::celestial(1, 0.0, (0.0, 0.0, 0.0), &name, true);
         let blob = encode(0, &[b]);
         assert_eq!(blob[blob.len() - 1 - 255 * 2], 255);
     }

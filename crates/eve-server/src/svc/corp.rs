@@ -579,13 +579,8 @@ async fn corp_station_mgr(
             Value::Double(0.0)
         }
 
-        "SetHomeStation" | "SetCloneTypeID" => {
-            return Outcome::Unknown(format!(
-                "corpStationMgr::{method}({}) has no column to write -- character_ has no \
-                 homeStationID or cloneTypeID",
-                arg0.unwrap_or(0)
-            ))
-        }
+        "SetCloneTypeID" => return crate::svc::medical::set_clone_type(ctx, arg0.unwrap_or(0)).await,
+        "SetHomeStation" => return crate::svc::medical::set_home_station(ctx, arg0.unwrap_or(0)).await,
         "RentOffice" => {
             let quoted = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
             return rent_office(ctx, station, quoted).await;
