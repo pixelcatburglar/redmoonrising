@@ -1,3 +1,4 @@
+pub mod agent_missions;
 pub mod agents;
 pub mod alert;
 pub mod alliance;
@@ -13,6 +14,7 @@ pub mod dogma;
 pub mod factory;
 pub mod fitting;
 pub mod gang;
+pub mod gm;
 pub mod inflight;
 pub mod insurance;
 pub mod inventory;
@@ -115,11 +117,17 @@ pub fn registry() -> Registry {
         .add("LSC", handler!(chat::lsc))
         .add("onlineStatus", handler!(onlinestatus::online_status))
         .add("bookmark", handler!(bookmark::bookmark))
+        .add("voucher", handler!(bookmark::voucher))
         .add("petitioner", handler!(petition::petitioner))
         .add("lookupSvc", handler!(lookup::lookup_svc))
         .add("gangsta", handler!(gang::gangsta))
         // agents and missions
         .add_bound("agentMgr", handler!(agents::agent_mgr))
-        .add("missionMgr", handler!(missions::mission_mgr));
+        .add_bound("missionMgr", handler!(missions::mission_mgr))
+        // game masters
+        .add("slash", handler!(gm::slash))
+        .add("keeper", handler!(gm::dungeon_tools))
+        .add("dungeon", handler!(gm::dungeon_tools))
+        .add("benchmark", handler!(gm::benchmark));
     r
 }

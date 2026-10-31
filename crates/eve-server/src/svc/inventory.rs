@@ -29,6 +29,14 @@ const STATION_ID_MAX: i32 = 64_000_000;
 
 const UNLIMITED_CAPACITY: f64 = 9_000_000_000_000_000.0;
 
+/// flagFactoryBlueprint: a blueprint installed in a job, out of every
+/// listing until the job gives it back.
+pub const FLAG_FACTORY_BLUEPRINT: i32 = 36;
+
+/// What a blueprint item carries beyond the item row (GetSubContent reads
+/// them off ListStationBlueprintItems); None for a blueprint never researched.
+const BLUEPRINT_COLUMNS: &[&str] = &["copy", "materialLevel", "productivityLevel", "licensedProductionRunsRemaining"];
+
 pub const INVITEM_HEADER: &[&str] = &[
     "itemID", "typeID", "ownerID", "locationID", "flag", "contraband", "singleton",
     "quantity", "groupID", "categoryID", "customInfo",
@@ -135,8 +143,8 @@ fn contents_scope(ctx: &Ctx<'_>, container: Container) -> Option<(String, Vec<i3
                 let station = ctx.session.station_id?;
                 let owner = owner_id.or(ctx.session.char_id)?;
                 Some((
-                    r#"e."locationID" = $1 AND e."ownerID" = $2"#.to_string(),
-                    vec![station as i32, owner as i32],
+                    r#"e."locationID" = $1 AND e."ownerID" = $2 AND e."flag" <> $3"#.to_string(),
+                    vec![station as i32, owner as i32, FLAG_FACTORY_BLUEPRINT],
                 ))
             }
             CONTAINER_CORP_MARKET => {
@@ -149,7 +157,7 @@ fn contents_scope(ctx: &Ctx<'_>, container: Container) -> Option<(String, Vec<i3
             }
             CONTAINER_GLOBAL => {
                 let owner = ctx.session.char_id?;
-                Some((r#"e."ownerID" = $1"#.to_string(), vec![owner as i32]))
+                Some((r#"e."ownerID" = $1 AND e."flag" <> $2"#.to_string(), vec![owner as i32, FLAG_FACTORY_BLUEPRINT]))
             }
             CONTAINER_CHARACTER => {
                 let char_id = ctx.session.char_id?;
@@ -187,18 +195,43 @@ pub async fn list_station_items(
         None => return rowset(INVITEM_HEADER, Vec::new()),
     };
     let mut where_sql = String::from(
-        r#"e."ownerID" = $1
+        r#"e."ownerID" = $1 AND e."flag" <> $3
              AND (e."locationID" = $2
                   OR e."locationID" IN (SELECT c."itemID" FROM "entity" c
                                          WHERE c."locationID" = $2 AND c."ownerID" = $1))"#,
     );
-    let mut vals = vec![owner as i32, station_id as i32];
-    if blueprints_only {
-        where_sql.push_str(r#" AND g."categoryID" = $3"#);
-        vals.push(CATEGORY_BLUEPRINT);
+    let mut vals = vec![owner as i32, station_id as i32, FLAG_FACTORY_BLUEPRINT];
+    if !blueprints_only {
+        let sql = format!("{}{}", INVITEM_SELECT, where_sql);
+        return query_items(ctx, &sql, &vals).await;
     }
-    let sql = format!("{}{}", INVITEM_SELECT, where_sql);
-    query_items(ctx, &sql, &vals).await
+    where_sql.push_str(r#" AND g."categoryID" = $4"#);
+    vals.push(CATEGORY_BLUEPRINT);
+    let select = INVITEM_SELECT.replace(
+        r#"FROM "entity" e"#,
+        r#", b."copy", b."materialLevel", b."productivityLevel", b."licensedProductionRunsRemaining"
+           FROM "entity" e LEFT JOIN "invBlueprints" b ON b."itemID" = e."itemID""#,
+    );
+    let sql = format!("{select}{where_sql}");
+    let params: Vec<&(dyn ToSql + Sync)> = vals.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+    let header: Vec<&str> = INVITEM_HEADER.iter().chain(BLUEPRINT_COLUMNS).copied().collect();
+    match ctx.db.query(&sql, &params).await {
+        Ok(rows) => {
+            let lines = rows
+                .iter()
+                .map(|r| {
+                    let mut cells = invitem_cells(r);
+                    cells.extend((0..BLUEPRINT_COLUMNS.len()).map(|i| crate::svc::rows::cell(r, INVITEM_HEADER.len() + i)));
+                    Value::List(cells)
+                })
+                .collect();
+            rowset(&header, lines)
+        }
+        Err(e) => {
+            error!("invbroker blueprint listing: {err}", err = crate::logging::chain(&e));
+            rowset(&header, Vec::new())
+        }
+    }
 }
 
 pub async fn list_stations(ctx: &Ctx<'_>, blueprints_only: bool, for_corp: bool) -> Value {
@@ -215,7 +248,7 @@ pub async fn list_stations(ctx: &Ctx<'_>, blueprints_only: bool, for_corp: bool)
              JOIN "invTypes" t ON t."typeID" = e."typeID"
              JOIN "invGroups" g ON g."groupID" = t."groupID"
             WHERE e."ownerID" = $1 AND e."locationID" >= $2 AND e."locationID" < $3
-              AND g."categoryID" = $4
+              AND g."categoryID" = $4 AND e."flag" <> 36
             GROUP BY e."locationID""#
     } else {
         r#"SELECT e."locationID", count(*)::int AS "itemCount"
@@ -265,18 +298,29 @@ pub async fn get_capacity(ctx: &Ctx<'_>, container: Container, flag: Option<i64>
 
     let capacity = match container {
         Container::Item(item_id) => {
+            // A silo's tower may raise its capacity.
+            let silo = match crate::svc::moonmining::silo_capacity(ctx.db, item_id).await {
+                Ok(silo) => silo,
+                Err(e) => {
+                    error!("invbroker GetCapacity silo: {err}", err = crate::logging::chain(&e));
+                    None
+                }
+            };
             let sql = r#"SELECT t."capacity" FROM "entity" e
                            JOIN "invTypes" t ON t."typeID" = e."typeID"
                           WHERE e."itemID" = $1"#;
-            match ctx.db.query(sql, &[&(item_id as i32)]).await {
-                Ok(rows) => rows
-                    .first()
-                    .and_then(|r| r.try_get::<_, f64>(0).ok())
-                    .unwrap_or(0.0),
-                Err(e) => {
-                    error!("invbroker GetCapacity capacity: {err}", err = crate::logging::chain(&e));
-                    0.0
-                }
+            match silo {
+                Some(capacity) => capacity,
+                None => match ctx.db.query(sql, &[&(item_id as i32)]).await {
+                    Ok(rows) => rows
+                        .first()
+                        .and_then(|r| r.try_get::<_, f64>(0).ok())
+                        .unwrap_or(0.0),
+                    Err(e) => {
+                        error!("invbroker GetCapacity capacity: {err}", err = crate::logging::chain(&e));
+                        0.0
+                    }
+                },
             }
         }
         Container::Special { .. } => UNLIMITED_CAPACITY,

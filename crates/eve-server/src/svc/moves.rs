@@ -244,7 +244,10 @@ async fn destination(
                 if !holder.singleton {
                     return refuse("Assemble the container before putting things in it.");
                 }
-                let capacity = type_capacity(txn, holder.type_id).await?;
+                let capacity = match crate::svc::moonmining::silo_capacity(txn.tx(), holder.id).await? {
+                    Some(silo) => silo,
+                    None => type_capacity(txn, holder.type_id).await?,
+                };
                 if capacity <= 0.0 {
                     return refuse("That item cannot hold anything.");
                 }
@@ -279,10 +282,13 @@ async fn used(txn: &ItemTxn<'_>, dest: &Destination, except: i64) -> DbResult<f6
     let r = txn
         .tx()
         .query_one(
-            r#"SELECT coalesce(sum(t."volume" * e."quantity"), 0)::float8
+            r#"SELECT coalesce(sum(CASE WHEN e."typeID" = $4
+                                        THEN (SELECT coalesce(sum(ct."volume" * c."quantity"), 0) FROM entity c
+                                                JOIN "invTypes" ct ON ct."typeID" = c."typeID" WHERE c."locationID" = e."itemID")
+                                        ELSE t."volume" * e."quantity" END), 0)::float8
                  FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID"
                 WHERE e."locationID" = $1 AND e."flag" = $2 AND e."itemID" <> $3"#,
-            &[&(dest.location as i32), &(dest.flag as i32), &(except as i32)],
+            &[&(dest.location as i32), &(dest.flag as i32), &(except as i32), &(crate::svc::missions::TYPE_PLASTIC_WRAP as i32)],
         )
         .await?;
     Ok(r.get(0))
@@ -291,7 +297,12 @@ async fn used(txn: &ItemTxn<'_>, dest: &Destination, except: i64) -> DbResult<f6
 async fn check_room(txn: &ItemTxn<'_>, dest: &Destination, item: &Item, quantity: i64) -> Result<(), MoveError> {
     let Some(capacity) = dest.capacity else { return Ok(()) };
     let free = capacity - used(txn, dest, item.id).await?;
-    let needed = item.volume * quantity as f64;
+    // A courier package takes the room of what is wrapped in it.
+    let needed = if item.type_id == crate::svc::missions::TYPE_PLASTIC_WRAP {
+        crate::svc::missions::package_volume(txn.tx(), item.id).await?
+    } else {
+        item.volume * quantity as f64
+    };
     if needed > free + 1e-6 {
         return refuse(format!("Not enough room: that needs {needed:.2} m3 and only {free:.2} m3 is free."));
     }
@@ -393,6 +404,9 @@ async fn add(
             return refuse("Modules can only be unfitted while docked.");
         }
         fitting::unfit(txn, &item, dest.location, dest.flag).await?;
+    }
+    if let Some(why) = crate::svc::moonmining::refuses(txn.tx(), dest.location, item.id, item.type_id).await? {
+        return refuse(why);
     }
     let quantity = if item.singleton { 1 } else { quantity.unwrap_or(item.quantity).clamp(1, item.quantity) };
     check_room(txn, dest, &item, quantity).await?;

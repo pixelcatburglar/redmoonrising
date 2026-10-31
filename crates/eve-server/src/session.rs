@@ -2,6 +2,7 @@ use eve_marshal::Value;
 
 pub const ROLE_LOGIN: i64 = 1;
 pub const ROLE_PLAYER: i64 = 2;
+pub const ROLE_PETITIONEE: i64 = 256;
 
 pub const CORP_ROLE_DIRECTOR: i64 = 1;
 pub const CORP_ROLE_ACCOUNTANT: i64 = 256;

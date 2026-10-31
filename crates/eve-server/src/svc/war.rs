@@ -457,6 +457,22 @@ pub fn sides_at_war(x: i64, y: i64) -> bool {
     IN_FORCE.read().is_ok_and(|wars| wars.iter().any(|w| hostile(*w, x, y, now)))
 }
 
+/// The sides `x` is at war with, in a hostile state.
+pub fn enemies_of(x: i64) -> Vec<i64> {
+    let now = crate::bulkdata::filetime_now();
+    let Ok(wars) = IN_FORCE.read() else { return Vec::new() };
+    let mut enemies: Vec<i64> = wars
+        .iter()
+        .filter_map(|w| {
+            let y = if w.0 == x { w.1 } else if w.1 == x { w.0 } else { return None };
+            hostile(*w, x, y, now).then_some(y)
+        })
+        .collect();
+    enemies.sort_unstable();
+    enemies.dedup();
+    enemies
+}
+
 fn hostile((by, against, declared, retracted): Span, x: i64, y: i64, now: i64) -> bool {
     let pair = (by == x && against == y) || (by == y && against == x);
     pair && now - declared >= DAY && retracted.is_none_or(|r| now - r < DAY)

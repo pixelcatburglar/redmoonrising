@@ -41,6 +41,7 @@ const ATTR_POWER: i32 = 30;
 const ATTR_CPU: i32 = 50;
 const ATTR_POWER_OUTPUT: i32 = 11;
 const ATTR_CPU_OUTPUT: i32 = 48;
+const ATTR_HARVESTER_CPU_BONUS: i32 = 756;
 const ATTR_MAX_STRUCTURE_DISTANCE: i32 = 650;
 const ATTR_TOWER_PERIOD: i32 = 722;
 const ATTR_ANCHORING_SECURITY_MAX: i32 = 1032;
@@ -378,7 +379,8 @@ async fn draw_from_tower(ctx: &Ctx<'_>, system: i64, s: &Structure, now: i64) ->
     let mut types = drawing.clone();
     types.extend([s.type_id, tower.type_id]);
     let a = type_attributes(ctx.db, &types, &[ATTR_CPU, ATTR_POWER, ATTR_CPU_OUTPUT, ATTR_POWER_OUTPUT]).await;
-    let get = |t: i64, attr: i32| a.get(&(t, attr)).copied().unwrap_or(0.0);
+    let cpu = cpu_factors(ctx.db, tower.type_id, &types).await;
+    let get = |t: i64, attr: i32| a.get(&(t, attr)).copied().unwrap_or(0.0) * if attr == ATTR_CPU { cpu(t) } else { 1.0 };
     let used = |attr: i32| drawing.iter().map(|t| get(*t, attr)).sum::<f64>();
     let fuel = Fuel::of(ctx.db, &tower, system).await;
     for (attr, output, purpose, lacks, what) in [
@@ -874,12 +876,30 @@ async fn tower_load(db: &impl GenericClient, tower: &Structure) -> (f64, f64) {
     let mut types = drawing.clone();
     types.push(tower.type_id);
     let a = type_attributes(db, &types, &[ATTR_CPU, ATTR_POWER, ATTR_CPU_OUTPUT, ATTR_POWER_OUTPUT]).await;
-    let get = |t: i64, attr: i32| a.get(&(t, attr)).copied().unwrap_or(0.0);
+    let cpu = cpu_factors(db, tower.type_id, &types).await;
+    let get = |t: i64, attr: i32| a.get(&(t, attr)).copied().unwrap_or(0.0) * if attr == ATTR_CPU { cpu(t) } else { 1.0 };
     let load = |attr: i32, output: i32| {
         let out = get(tower.type_id, output);
         if out <= 0.0 { 0.0 } else { drawing.iter().map(|t| get(*t, attr)).sum::<f64>() / out }
     };
     (load(ATTR_POWER, ATTR_POWER_OUTPUT), load(ATTR_CPU, ATTR_CPU_OUTPUT))
+}
+
+/// What each type's CPU need is multiplied by at this tower: its
+/// controlTowerMoonHarvesterCPUBonus (a percentage) for moon harvesters, 1
+/// for everything else.
+async fn cpu_factors(db: &impl GenericClient, tower_type: i64, types: &[i64]) -> impl Fn(i64) -> f64 {
+    let bonus = type_attributes(db, &[tower_type], &[ATTR_HARVESTER_CPU_BONUS]).await.get(&(tower_type, ATTR_HARVESTER_CPU_BONUS)).copied().unwrap_or(0.0);
+    let ids: Vec<i32> = types.iter().map(|t| *t as i32).collect();
+    let sql = r#"SELECT "typeID" FROM "invTypes" WHERE "typeID" = ANY($1) AND "groupID" = $2"#;
+    let harvesters: Vec<i64> = match db.query(sql, &[&ids, &(moonmining::GROUP_MOON_MINING as i32)]).await {
+        Ok(rows) => rows.iter().filter_map(|r| int(r, 0)).collect(),
+        Err(e) => {
+            error!("reading which structures are harvesters: {}", crate::logging::chain(&e));
+            Vec::new()
+        }
+    };
+    move |t| if harvesters.contains(&t) { 1.0 + bonus / 100.0 } else { 1.0 }
 }
 
 // ---- sovereignty -----------------------------------------------------------------------

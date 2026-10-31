@@ -34,6 +34,7 @@ const ATTR_CARGO_GROUP: i32 = 629;
 const ATTR_HARVESTER_QUALITY: i32 = 710;
 const ATTR_MOON_MINING_AMOUNT: i32 = 726;
 const ATTR_REACTION_GROUP: [i32; 2] = [842, 843];
+const ATTR_SILO_CAPACITY_BONUS: i32 = 757;
 /// Moon material tiers by base price, with how often each turns up.
 const TIERS: [(f64, u32); 5] = [(2.0, 45), (8.0, 25), (16.0, 15), (64.0, 10), (256.0, 5)];
 /// How many materials a moon holds, with how often: none, one, two, three.
@@ -162,6 +163,80 @@ async fn reaction_in(db: &impl GenericClient, reactor: i64) -> Option<(i64, i64)
                   ORDER BY e."itemID" LIMIT 1"#;
     let r = db.query_opt(sql, &[&(reactor as i32), &ATTR_REACTION_GROUP.to_vec()]).await.ok().flatten()?;
     Some((int(&r, 0)?, int(&r, 1)?))
+}
+
+/// A silo's capacity with its online tower's controlTowerSiloCapacityBonus
+/// (a PostPercent on capacity for the silo group); None for anything not a
+/// silo.
+pub async fn silo_capacity(db: &impl GenericClient, silo: i64) -> Result<Option<f64>, tokio_postgres::Error> {
+    let sql = r#"SELECT t."capacity" * (1 + COALESCE(b."valueFloat", b."valueInt"::float8, 0) / 100)
+                   FROM entity e
+                   JOIN "invTypes" t ON t."typeID" = e."typeID"
+                   LEFT JOIN "posStructures" p ON p."itemID" = e."itemID"
+                   LEFT JOIN "posStructures" tp ON tp."itemID" = p."controlTowerID" AND tp."state" IN (2, 3, 4, 5)
+                   LEFT JOIN entity te ON te."itemID" = tp."itemID"
+                   LEFT JOIN "dgmTypeAttributes" b ON b."typeID" = te."typeID" AND b."attributeID" = $3
+                  WHERE e."itemID" = $1 AND t."groupID" = $2"#;
+    let r = db.query_opt(sql, &[&(silo as i32), &(GROUP_SILO as i32), &ATTR_SILO_CAPACITY_BONUS]).await?;
+    Ok(r.and_then(|r| float(&r, 0)))
+}
+
+/// Why `container` will not take an item of `type_id` put in by hand, if it
+/// is a silo or reactor that won't: a silo holds only its cargo group, and
+/// only the type it is set to (or, unset, the one it already holds); a
+/// reactor holds one reaction, of a group it runs.
+pub async fn refuses(db: &impl GenericClient, container: i64, item: i64, type_id: i64) -> Result<Option<&'static str>, tokio_postgres::Error> {
+    let sql = r#"SELECT t."groupID", e."typeID", p."provisionType" FROM entity e
+                   JOIN "invTypes" t ON t."typeID" = e."typeID"
+                   LEFT JOIN "posStructures" p ON p."itemID" = e."itemID"
+                  WHERE e."itemID" = $1"#;
+    let Some(r) = db.query_opt(sql, &[&(container as i32)]).await? else { return Ok(None) };
+    let (group, holder_type, provision) = (int(&r, 0).unwrap_or(0), int(&r, 1).unwrap_or(0), int(&r, 2));
+    let item_group = db
+        .query_opt(r#"SELECT "groupID" FROM "invTypes" WHERE "typeID" = $1"#, &[&(type_id as i32)])
+        .await?
+        .and_then(|r| int(&r, 0))
+        .unwrap_or(0);
+    let others = r#"SELECT 1 FROM entity WHERE "locationID" = $1 AND "itemID" <> $2 AND "typeID" <> $3 LIMIT 1"#;
+    match group {
+        GROUP_SILO => {
+            let cargo = type_attribute(db, &[holder_type], ATTR_CARGO_GROUP).await.get(&holder_type).map(|g| *g as i64);
+            if cargo.is_some_and(|g| g != item_group) {
+                return Ok(Some("That silo cannot hold that."));
+            }
+            match provision {
+                Some(p) if p != type_id => Ok(Some("That silo is set to hold something else.")),
+                Some(_) => Ok(None),
+                None if db.query_opt(others, &[&(container as i32), &(item as i32), &(type_id as i32)]).await?.is_some() => {
+                    Ok(Some("That silo already holds something else."))
+                }
+                None => Ok(None),
+            }
+        }
+        GROUP_REACTOR => {
+            let runs = type_attribute_all(db, holder_type, &ATTR_REACTION_GROUP).await?;
+            let reaction = db
+                .query_opt(r#"SELECT 1 FROM "invTypeReactions" WHERE "reactionTypeID" = $1 LIMIT 1"#, &[&(type_id as i32)])
+                .await?
+                .is_some();
+            if !reaction || !runs.contains(&item_group) {
+                return Ok(Some("That reactor cannot run that."));
+            }
+            let any = r#"SELECT 1 FROM entity WHERE "locationID" = $1 AND "itemID" <> $2 LIMIT 1"#;
+            if db.query_opt(any, &[&(container as i32), &(item as i32)]).await?.is_some() {
+                return Ok(Some("That reactor already holds a reaction."));
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Every value a type has among `attrs`, as integers.
+async fn type_attribute_all(db: &impl GenericClient, type_id: i64, attrs: &[i32]) -> Result<Vec<i64>, tokio_postgres::Error> {
+    let sql = r#"SELECT COALESCE("valueFloat", "valueInt"::float8)::int8 FROM "dgmTypeAttributes"
+                  WHERE "typeID" = $1 AND "attributeID" = ANY($2)"#;
+    Ok(db.query(sql, &[&(type_id as i32), &attrs.to_vec()]).await?.iter().filter_map(|r| int(r, 0)).collect())
 }
 
 /// A reaction's (inputs, outputs): (typeID, batches).
@@ -413,17 +488,17 @@ async fn held(txn: &ItemTxn<'_>, silo: i64, t: i64) -> Result<i64, tokio_postgre
 
 /// How many more units of `t` a silo can take.
 async fn room(txn: &ItemTxn<'_>, silo: &Producer, t: i64) -> Result<i64, tokio_postgres::Error> {
+    let capacity = silo_capacity(txn.tx(), silo.id).await?.unwrap_or(0.0);
     let r = txn
         .tx()
         .query_one(
-            r#"SELECT (SELECT COALESCE("capacity", 0) FROM "invTypes" WHERE "typeID" = $2)
-                    - (SELECT COALESCE(sum(t."volume" * e."quantity"), 0) FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID" WHERE e."locationID" = $1),
-                      (SELECT GREATEST("volume", 0.0001) FROM "invTypes" WHERE "typeID" = $3)"#,
-            &[&(silo.id as i32), &(silo.type_id as i32), &(t as i32)],
+            r#"SELECT (SELECT COALESCE(sum(t."volume" * e."quantity"), 0) FROM entity e JOIN "invTypes" t ON t."typeID" = e."typeID" WHERE e."locationID" = $1),
+                      (SELECT GREATEST("volume", 0.0001) FROM "invTypes" WHERE "typeID" = $2)"#,
+            &[&(silo.id as i32), &(t as i32)],
         )
         .await?;
-    let (free, volume) = (float(&r, 0).unwrap_or(0.0), float(&r, 1).unwrap_or(1.0));
-    Ok((free / volume).floor().max(0.0) as i64)
+    let (used, volume) = (float(&r, 0).unwrap_or(0.0), float(&r, 1).unwrap_or(1.0));
+    Ok(((capacity - used) / volume).floor().max(0.0) as i64)
 }
 
 /// Adds up to `n` of `t` to a silo, as much as fits, on the stack already there.

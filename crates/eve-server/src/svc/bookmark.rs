@@ -23,16 +23,128 @@ pub async fn bookmark(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "UpdateBookmark" => update_bookmark(ctx, arg(0).unwrap_or(0), call.arg_text(2)).await,
         "DeleteBookmarks" => delete_bookmarks(ctx, call.args.first()).await,
 
-        "CreateBookmarkVoucher" | "CreateBookmarkVouchers" | "AddBookmarkFromVoucher" => {
-            return Some(Outcome::Unknown(format!(
-                "bookmark::{} needs the voucher entity path (recon/12 §4.5)",
-                call.method
-            )))
+        // CreateBookmarkVoucher(bookmarkID, memo) -> the voucher, which the
+        // container it was dropped on then takes (container.py:457).
+        "CreateBookmarkVoucher" => match make_vouchers(ctx, &[(arg(0).unwrap_or(0), call.arg_text(1))]).await {
+            Ok(mut made) => made.pop().unwrap_or(Value::None),
+            Err(refusal) => return Some(refusal),
+        },
+        // CreateBookmarkVouchers([(bookmarkID, memo) or (bookmarkID,)]).
+        "CreateBookmarkVouchers" => {
+            let wanted: Vec<(i64, Option<String>)> = call
+                .args
+                .first()
+                .and_then(|v| v.seq())
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|p| {
+                    let p = p.seq()?;
+                    Some((p.first()?.as_i64()?, p.get(1).and_then(|m| m.as_string())))
+                })
+                .collect();
+            match make_vouchers(ctx, &wanted).await {
+                Ok(made) => Value::List(made),
+                Err(refusal) => return Some(refusal),
+            }
         }
+        // AddBookmarkFromVoucher(voucherID): the voucher's bookmark, copied
+        // into the caller's places; the voucher stays.
+        "AddBookmarkFromVoucher" => from_voucher(ctx, arg(0).unwrap_or(0)).await,
 
         _ => return None,
     };
     Some(Outcome::Value(value))
+}
+
+/// typeBookmark, of groupVoucher.
+const TYPE_BOOKMARK: i64 = 51;
+const FLAG_HANGAR: i64 = 4;
+const FLAG_CARGO: i64 = 5;
+
+/// Bookmarks made into vouchers: in the station hangar when docked, else in
+/// the ship's hold. Each answer carries its voucherID.
+async fn make_vouchers(ctx: &Ctx<'_>, wanted: &[(i64, Option<String>)]) -> Result<Vec<Value>, Outcome> {
+    let Some(me) = ctx.session.char_id else { return Err(Outcome::custom("No character.")) };
+    let (location, flag) = match (ctx.session.station_id, ctx.session.ship_id) {
+        (Some(station), _) => (station, FLAG_HANGAR),
+        (None, Some(ship)) => (ship, FLAG_CARGO),
+        _ => return Err(Outcome::custom("You have nowhere to keep a voucher.")),
+    };
+    let made = async {
+        let mut client = crate::db::connect(ctx.db_url).await?;
+        let mut txn = crate::items::ItemTxn::begin(&mut client).await?;
+        let mut out = Vec::new();
+        for (bookmark_id, memo) in wanted {
+            let sql = r#"SELECT "itemID","typeID","flag","memo","created","x","y","z","locationID" FROM bookmarks
+                          WHERE "bookmarkID" = $1 AND "ownerID" = $2"#;
+            let Some(b) = txn.tx().query_opt(sql, &[&(*bookmark_id as i32), &(me as i32)]).await? else {
+                out.push(Value::None);
+                continue;
+            };
+            let id = txn.create(crate::items::NewItem { type_id: TYPE_BOOKMARK, owner_id: me, location_id: location, flag, quantity: 1, singleton: true }).await?;
+            let memo: String = memo.clone().unwrap_or_else(|| b.get(3));
+            let sql = r#"INSERT INTO "bookmarkVouchers" ("voucherID","itemID","typeID","flag","memo","created","x","y","z","locationID")
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"#;
+            let (item, type_id, bflag): (i32, i32, Option<i32>) = (b.get(0), b.get(1), b.get(2));
+            let (created, x, y, z, loc): (i64, Option<f64>, Option<f64>, Option<f64>, i32) = (b.get(4), b.get(5), b.get(6), b.get(7), b.get(8));
+            txn.tx().execute(sql, &[&(id as i32), &item, &type_id, &bflag, &memo, &created, &x, &y, &z, &loc]).await?;
+            out.push(crate::svc::rows::key_val(vec![("voucherID", Value::Int(id))]));
+        }
+        let events = txn.commit().await?;
+        Ok::<_, tokio_postgres::Error>((out, events))
+    }
+    .await;
+    match made {
+        Ok((out, events)) => {
+            crate::items::notify(ctx.world, ctx.client_id, events);
+            let count = out.iter().filter(|v| !matches!(v, Value::None)).count();
+            tracing::info!("{me} made {count} bookmark voucher(s)");
+            Ok(out)
+        }
+        Err(e) => {
+            error!("making bookmark vouchers: {}", crate::logging::chain(&e));
+            Err(Outcome::custom("The voucher could not be made."))
+        }
+    }
+}
+
+async fn from_voucher(ctx: &Ctx<'_>, voucher_id: i64) -> Value {
+    let Some(me) = ctx.session.char_id else { return Value::None };
+    let sql = format!(
+        r#"WITH v AS (SELECT b.* FROM "bookmarkVouchers" b JOIN entity e ON e."itemID" = b."voucherID"
+                       WHERE b."voucherID" = $1 AND e."ownerID" = $2)
+           INSERT INTO bookmarks ("ownerID","itemID","typeID","flag","memo","created","x","y","z","locationID")
+           SELECT $2, "itemID","typeID","flag","memo","created","x","y","z","locationID" FROM v
+           RETURNING "bookmarkID","ownerID","itemID","typeID","flag","memo","created","x","y","z","locationID""#
+    );
+    match ctx.query_one(sql.as_str(), &[&(voucher_id as i32), &(me as i32)]).await {
+        Some(r) => crate::svc::rows::row(BOOKMARK_HEADER, crate::svc::rows::line(&r)),
+        None => Value::None,
+    }
+}
+
+/// `voucher`: GetObject(voucherID), the voucher.Bookmark the client keeps
+/// (voucherCache.py): its item row as header and data, and the memo it
+/// shows as its name.
+pub async fn voucher(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
+    if call.method != "GetObject" {
+        return None;
+    }
+    let id = call.arg_id(0) as i32;
+    let sql = format!(r#"{} e."itemID" = $1"#, crate::svc::inventory::INVITEM_SELECT);
+    let Some(item) = ctx.query_one(sql.as_str(), &[&id]).await else { return Some(Outcome::Value(Value::None)) };
+    let memo = ctx
+        .query_one(r#"SELECT "memo" FROM "bookmarkVouchers" WHERE "voucherID" = $1"#, &[&id])
+        .await
+        .and_then(|r| crate::svc::rows::text(&r, 0))
+        .unwrap_or_else(|| "Bookmark".into());
+    let header = Value::List(crate::svc::inventory::INVITEM_HEADER.iter().map(|h| Value::bytes(*h)).collect());
+    let state = Value::Dict(vec![
+        (Value::bytes("header"), header),
+        (Value::bytes("data"), Value::List(crate::svc::inventory::invitem_cells(&item))),
+        (Value::bytes("description"), Value::text(memo)),
+    ]);
+    Some(Outcome::Value(Value::Instance { class: Box::new(Value::bytes("voucher.Bookmark")), state: Box::new(state) }))
 }
 
 async fn get_bookmarks(ctx: &Ctx<'_>) -> Value {

@@ -7,7 +7,7 @@
 //! awaits while holding it: notifications are queued, not sent.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use eve_marshal::Value;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -35,13 +35,29 @@ pub enum Move {
     /// The character's corporation, its alliance or its roles changed; the
     /// connection reads them again.
     Affiliation,
+    /// The character joined, left or now leads (or no longer leads) a gang.
+    Gang { gang_id: Option<i64>, leader: bool },
+    /// A GM's /tr: into a station, or to a point in a system's space (only
+    /// from space).
+    Teleport { station_id: Option<i64>, solar_system_id: i64, constellation_id: i64, region_id: i64, pos: (f64, f64, f64) },
+}
+
+/// A call the server makes on one of the client's own services; the answer
+/// (None if the client raised, or went away) comes back on `reply`.
+#[derive(Debug)]
+pub struct ClientCall {
+    pub service: &'static str,
+    pub method: &'static str,
+    pub args: Vec<Value>,
+    pub reply: tokio::sync::oneshot::Sender<Option<Value>>,
 }
 
 /// What a connection's queue carries, in the order it was queued.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Push {
     Notify(Notification),
     Move(Move),
+    Call(ClientCall),
 }
 
 /// Where one connected character is.
@@ -53,6 +69,8 @@ pub struct Presence {
     pub docked: bool,
     /// The station, when docked.
     pub station_id: Option<i64>,
+    /// The session's role mask.
+    pub role: i64,
 }
 
 struct Client {
@@ -75,11 +93,13 @@ pub struct WorldState {
     pub trades: HashMap<i64, crate::svc::pvptrade::Trade>,
     /// Solar system -> its ballpark. Created when the first ship arrives.
     pub parks: HashMap<i64, Park>,
+    pub gangs: crate::svc::gang::Gangs,
 }
 
-#[derive(Default)]
+/// A handle on the shared world; clones share it, for tasks that outlive a call.
+#[derive(Default, Clone)]
 pub struct World {
-    state: Mutex<WorldState>,
+    state: Arc<Mutex<WorldState>>,
 }
 
 impl World {
@@ -99,6 +119,9 @@ impl WorldState {
     /// Forgets a connection and its chat memberships; returns each channel it
     /// was in with the members left, for the caller to announce the departure.
     pub fn disconnect(&mut self, client_id: i64) -> Vec<(Value, Vec<i64>)> {
+        if let Some(char_id) = self.clients.get(&client_id).and_then(|c| c.presence).map(|p| p.char_id) {
+            crate::svc::gang::logged_off(self, char_id);
+        }
         self.clients.remove(&client_id);
         let mut left = Vec::new();
         for channel in self.channels.values_mut() {
@@ -124,6 +147,16 @@ impl WorldState {
             .filter(|(_, c)| c.presence.is_some_and(|p| p.char_id == char_id))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Clients whose session holds every bit of `role`.
+    pub fn with_role(&self, role: i64) -> Vec<i64> {
+        self.clients.iter().filter(|(_, c)| c.presence.is_some_and(|p| p.role & role == role)).map(|(id, _)| *id).collect()
+    }
+
+    /// Where `char_id` is, if online.
+    pub fn presence_of(&self, char_id: i64) -> Option<Presence> {
+        self.clients.values().filter_map(|c| c.presence).find(|p| p.char_id == char_id)
     }
 
     /// The station `char_id` is docked in, if online and docked.
@@ -183,6 +216,15 @@ impl WorldState {
                 let _ = c.tx.send(Push::Notify(Notification { event, args: args.clone() }));
             }
         }
+    }
+
+    /// Calls `service.method(*args)` on a client; the receiver yields its
+    /// answer. None if the client is not connected.
+    pub fn call(&self, client_id: i64, service: &'static str, method: &'static str, args: Vec<Value>) -> Option<tokio::sync::oneshot::Receiver<Option<Value>>> {
+        let c = self.clients.get(&client_id)?;
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        c.tx.send(Push::Call(ClientCall { service, method, args, reply })).ok()?;
+        Some(answer)
     }
 
     /// Queues a session move for one client, after anything already queued.
@@ -246,7 +288,7 @@ mod tests {
     use super::*;
 
     fn presence(char_id: i64, docked: bool) -> Option<Presence> {
-        Some(Presence { char_id, corp_id: 1000044, solar_system_id: 30002780, docked, station_id: None })
+        Some(Presence { char_id, corp_id: 1000044, solar_system_id: 30002780, docked, station_id: None, role: 3 })
     }
 
     #[test]

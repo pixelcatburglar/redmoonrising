@@ -671,7 +671,7 @@ fn deaths(park: &mut Park, now: i64, out: &mut Out) {
         let Some(ship) = detach(park, id, now, out) else { continue };
         let killer = ship.fight.as_ref().and_then(|f| f.last_attacker);
         if ship.npc.is_some() {
-            npc::killed(park, &ship, now);
+            npc::killed(park, &ship, now, out);
             let bounty = ship.npc.as_ref().map_or(0.0, |b| b.bounty);
             info!("{} ({id}) destroyed by {}, bounty {bounty}", ship.pilot.name, culprit(park, killer));
             let brain = ship.npc.as_ref().expect("an NPC has a brain");

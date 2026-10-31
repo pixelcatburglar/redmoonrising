@@ -367,6 +367,17 @@ impl Conn {
                 self.send_session_change_from(&before).await?;
                 info!(ship = ?ship_id, "capsule destroyed; woke up in a clone at station {station_id}");
             }
+            Move::Gang { gang_id, leader } => {
+                self.session.gang_id = gang_id;
+                self.session.gang_role = gang_id.map(|_| if leader { crate::svc::gang::GANG_LEADER_ROLE } else { 0 });
+                if self.session.change_from(&before) != Value::Dict(Vec::new()) {
+                    self.send_session_change_from(&before).await?;
+                    info!(gang = ?gang_id, leader, "gang changed");
+                }
+            }
+            Move::Teleport { station_id, solar_system_id, constellation_id, region_id, pos } => {
+                self.teleport(station_id, solar_system_id, constellation_id, region_id, Vec3::new(pos.0, pos.1, pos.2)).await?;
+            }
             Move::Affiliation => {
                 let Some(char_id) = self.session.char_id else { return Ok(()) };
                 self.load_affiliation(char_id).await;
@@ -374,6 +385,46 @@ impl Conn {
                     self.send_session_change_from(&before).await?;
                     info!(corp = ?self.session.corp_id, alliance = ?self.session.alliance_id, "affiliation changed");
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// /tr: out of where the ship is, and into the station or the spot given.
+    async fn teleport(&mut self, station_id: Option<i64>, system: i64, constellation: i64, region: i64, pos: Vec3) -> Result {
+        let (Some(char_id), Some(ship_id)) = (self.session.char_id, self.session.ship_id) else { return Ok(()) };
+        let from = self.session.solar_system_id;
+        if station_id.is_none() && from.is_none() {
+            warn!("teleport into space from a station; ignored");
+            return Ok(());
+        }
+        let ship = from.and_then(|s| space::remove_ship(&mut self.server.world.lock(), s, ship_id));
+        if let Some(fight) = ship.as_ref().and_then(|s| s.fight.as_ref()) {
+            inflight::save_vitals(&self.server.db, ship_id, fight, true).await;
+        }
+        let before = self.session.clone();
+        self.session.solar_system_id2 = Some(system);
+        self.session.constellation_id = Some(constellation);
+        self.session.region_id = Some(region);
+        match station_id {
+            Some(station) => {
+                self.session.station_id = Some(station);
+                self.session.solar_system_id = None;
+                self.session.ship_id = self.store_docked(char_id, ship_id, station).await;
+                self.send_session_change_from(&before).await?;
+                info!("teleported into station {station}");
+            }
+            None => {
+                space::ensure_park(&self.ctx(), system).await;
+                self.session.solar_system_id = Some(system);
+                self.send_session_change_from(&before).await?;
+                if let Some(mut ship) = ship {
+                    ship.pos = pos;
+                    ship.vel = Vec3::ZERO;
+                    ship.command = Command::Stop;
+                    space::add_ship(&mut self.server.world.lock(), system, ship);
+                }
+                info!("teleported to {pos:?} in {system}");
             }
         }
         Ok(())

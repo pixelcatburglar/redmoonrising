@@ -23,7 +23,7 @@ use tracing::{error, info};
 use crate::services::{Call, Ctx, Outcome};
 use crate::session::CORP_ROLE_DIRECTOR;
 use crate::svc::membership::{access_denied, db_failed, message, Refused};
-use crate::svc::rows::{change, index_rowset, int, line};
+use crate::svc::rows::{change, index_rowset, int, line, text};
 use crate::world::World;
 
 /// eveConstants vote*.
@@ -389,6 +389,7 @@ async fn resign(ctx: &Ctx<'_>, successor: Option<i64>) -> Refused<Value> {
         None => Ok(Value::List(others.into_iter().map(Value::Int).collect())),
         Some(next) if others.contains(&next) => {
             hand_over(ctx.db, ctx.world, corp, me, next).await?;
+            announce_resignation(ctx, corp, me, next).await;
             Ok(Value::None)
         }
         Some(_) => Err(message("CrpCharNotInThisCorp")),
@@ -415,6 +416,21 @@ pub async fn hand_over(db: &impl GenericClient, world: &World, corp: i64, old: i
     Ok(())
 }
 
+/// A mail to the corporation's mailbox, from the outgoing CEO, naming who
+/// takes over.
+async fn announce_resignation(ctx: &Ctx<'_>, corp: i64, old: i64, new: i64) {
+    let sql = r#"SELECT (SELECT "characterName" FROM "character_" WHERE "characterID" = $1),
+                        (SELECT "characterName" FROM "character_" WHERE "characterID" = $2),
+                        (SELECT "corporationName" FROM "corporation" WHERE "corporationID" = $3)"#;
+    let Some(r) = ctx.query_one(sql, &[&(old as i32), &(new as i32), &(corp as i32)]).await else { return };
+    let name = |i| text(&r, i).unwrap_or_default();
+    let subject = format!("{} has resigned as CEO", name(0));
+    let body = format!("{} has resigned as CEO of {}.<br>{} is the new CEO.", name(0), name(2), name(1));
+    if let Err(e) = crate::svc::chat::deliver(ctx.db, ctx.world, old, &[corp], &subject, &body).await {
+        error!("mailing corporation {corp} about its new CEO: {}", crate::logging::chain(&e));
+    }
+}
+
 /// The last member resigns: the corporation closes and they go back to
 /// their NPC corporation.
 async fn close(ctx: &Ctx<'_>, corp: i64, me: i64) -> Refused<()> {
@@ -439,6 +455,7 @@ async fn close(ctx: &Ctx<'_>, corp: i64, me: i64) -> Refused<()> {
         .await
         .map_err(|e| db_failed("closing the corporation", e))?;
     tx.commit().await.map_err(|e| db_failed("COMMIT", e))?;
+    crate::svc::membership::member_moved(ctx.world, me, corp, home);
     info!("{me} resigned as the last member of corporation {corp}, which is closed");
     ctx.world.lock().reaffiliate(&[], &[me]);
     Ok(())

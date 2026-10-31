@@ -298,7 +298,7 @@ pub fn course_entries(ship: &Ship, tick: i64) -> Vec<Value> {
 }
 
 /// SetState for `ego`: the whole park, then every moving ship's course.
-pub fn set_state_entries(park: &Park, ego: i64, station_owners: &[(i64, i64)]) -> Vec<Value> {
+pub fn set_state_entries(park: &Park, ego: i64, station_owners: &[(i64, i64)], char_gangs: &[(i64, i64)]) -> Vec<Value> {
     const DRONE_HEADER: &[&str] =
         &["droneID", "ownerID", "controllerID", "activityState", "typeID", "controllerOwnerID"];
     let mut balls: Vec<Ball> = park
@@ -314,6 +314,10 @@ pub fn set_state_entries(park: &Park, ego: i64, station_owners: &[(i64, i64)]) -
     for can in park.cans.values() {
         balls.push(Ball::celestial(can.id, can.radius, can.pos.tuple(), &can.name, false));
         slims.push(crate::loot::slim(can));
+    }
+    for site in park.sites.values() {
+        balls.push(site.ball());
+        slims.push(site.slim());
     }
     let mut damage = Vec::new();
     let now_ms = crate::combat::now_ms();
@@ -346,7 +350,10 @@ pub fn set_state_entries(park: &Park, ego: i64, station_owners: &[(i64, i64)]) -
         ("aggressors", park.watch.aggressors()),
         ("droneState", rowset(DRONE_HEADER, crate::drones::state_lines(park))),
         ("gangCorps", Value::List(Vec::new())),
-        ("charGangs", Value::List(Vec::new())),
+        (
+            "charGangs",
+            Value::List(char_gangs.iter().map(|(c, g)| Value::Tuple(vec![Value::Int(*c), Value::Int(*g)])).collect()),
+        ),
         ("damageState", Value::Dict(damage)),
         ("effectStates", Value::List(Vec::new())),
     ]);
@@ -449,7 +456,10 @@ async fn push_set_state(ctx: &Ctx<'_>) {
     if !park.ships.contains_key(&ship_id) {
         warn!("SetState for ship {ship_id}, which is not in the park of {system}");
     }
-    let entries = set_state_entries(park, ship_id, &owners);
+    let pilots: Vec<i64> = park.ships.values().map(|s| s.pilot.char_id).filter(|c| *c != 0).collect();
+    let char_gangs = world.gangs.memberships(pilots);
+    let Some(park) = world.parks.get(&system) else { return };
+    let entries = set_state_entries(park, ship_id, &owners, &char_gangs);
     debug!("SetState: {} ball(s), ego {ship_id}", park.celestials.len() + park.ships.len());
     broadcast(&world, system, Some(ctx.client_id), entries);
 }
@@ -500,16 +510,39 @@ async fn movement(ctx: &Ctx<'_>, call: &Call) -> Outcome {
     let Some(order) = parse_order(ctx, call).await else {
         return Outcome::Unknown(format!("beyonce::{} with arguments it cannot use", call.method));
     };
+    steer(ctx, system, ship_id, order, &call.method)
+}
+
+/// Warps the caller's ship to `range` off something at `at` of `radius`
+/// (an agent's location, say).
+pub fn warp_to_point(ctx: &Ctx<'_>, at: Vec3, radius: f64, range: f64, why: &str) -> Outcome {
+    let (Some(system), Some(ship_id)) = (ctx.session.solar_system_id, ctx.session.ship_id) else {
+        return Outcome::UserError { msg: "ShipNotYours".into(), args: Vec::new() };
+    };
+    let Some(target) = landing_point(ctx, at, radius + range.max(0.0)) else {
+        return Outcome::custom("Your ship is not in space here.");
+    };
+    steer(ctx, system, ship_id, Order::Command(Command::Warp { target, range: 0.0 }), why)
+}
+
+/// Flies the caller's ship straight to `at`.
+pub fn approach_point(ctx: &Ctx<'_>, at: Vec3, why: &str) -> Outcome {
+    let (Some(system), Some(ship_id)) = (ctx.session.solar_system_id, ctx.session.ship_id) else {
+        return Outcome::UserError { msg: "ShipNotYours".into(), args: Vec::new() };
+    };
+    steer(ctx, system, ship_id, Order::Command(Command::Point(at)), why)
+}
+
+/// Puts a movement order to a ship: the park follows it, and the system is told.
+fn steer(ctx: &Ctx<'_>, system: i64, ship_id: i64, order: Order, method: &str) -> Outcome {
     let mut world = ctx.world.lock();
     let Some(park) = world.parks.get_mut(&system) else {
-        return Outcome::Unknown(format!("beyonce::{}: no ballpark for {system}", call.method));
+        return Outcome::Unknown(format!("beyonce::{method}: no ballpark for {system}"));
     };
     park.advance(destiny::tick_now());
     let tick = park.tick;
     match park.ships.get(&ship_id) {
-        None => {
-            return Outcome::Unknown(format!("beyonce::{}: ship {ship_id} is not in space", call.method))
-        }
+        None => return Outcome::Unknown(format!("beyonce::{method}: ship {ship_id} is not in space")),
         // destiny ignores course changes mid-warp; so does the server.
         Some(ship) if ship.in_warp() => return Outcome::Value(Value::None),
         Some(ship)
@@ -743,7 +776,7 @@ mod tests {
     #[test]
     fn set_state_comes_first_and_moving_ships_are_put_back_on_course() {
         let park = park_with_moving_ship();
-        let entries = set_state_entries(&park, 1, &[]);
+        let entries = set_state_entries(&park, 1, &[], &[]);
         let opcode = |e: &Value| match e {
             Value::Tuple(t) => match &t[1] {
                 Value::Tuple(ev) => ev[0].clone(),

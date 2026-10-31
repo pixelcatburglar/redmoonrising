@@ -1,9 +1,9 @@
 //! `factory`: blueprint and material information for the info window (infosvc.py)
 //! and the facility window (facility.py).
 //!
-//! No table stores per-blueprint research yet, so every blueprint is an original
-//! at material and productivity level 0 with unlimited runs, the same defaults the
-//! client itself assumes for a blueprint type with no item.
+//! A blueprint's research and copy state is its invBlueprints row; one without
+//! is an original at material and productivity level 0 with unlimited runs,
+//! the same defaults the client itself assumes for a blueprint type with no item.
 
 use eve_marshal::Value;
 
@@ -44,15 +44,16 @@ pub async fn factory(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         }
         // (locationID, flag, isCorp): the blueprints in one hangar.
         "GetBlueprintInformationAtLocationWithFlag" => {
-            let sql = r#"SELECT e."itemID", e."typeID", e."quantity", 0 AS "copy",
-                                0 AS "materialLevel", 0 AS "productivityLevel",
-                                -1 AS "licensedProductionRunsRemaining"
+            let sql = r#"SELECT e."itemID", e."typeID", e."quantity", e."singleton",
+                                COALESCE(i."copy", 0), COALESCE(i."materialLevel", 0),
+                                COALESCE(i."productivityLevel", 0), COALESCE(i."licensedProductionRunsRemaining", -1)
                            FROM entity e
                            JOIN "invBlueprintTypes" b ON b."blueprintTypeID" = e."typeID"
+                           LEFT JOIN "invBlueprints" i ON i."itemID" = e."itemID"
                           WHERE e."locationID" = $1 AND e."flag" = $2
                           ORDER BY e."itemID""#;
             let header = [
-                "itemID", "typeID", "quantity", "copy", "materialLevel", "productivityLevel",
+                "itemID", "typeID", "quantity", "singleton", "copy", "materialLevel", "productivityLevel",
                 "licensedProductionRunsRemaining",
             ];
             let location = call.arg_id(0) as i32;
@@ -67,9 +68,12 @@ pub async fn factory(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 /// infosvc reads these keys from the dict (has_key) for a blueprint item.
 async fn blueprint_attributes(ctx: &Ctx<'_>, item_id: i64) -> Value {
     let sql = r#"SELECT b."productionTime", b."researchMaterialTime", b."researchCopyTime",
-                        b."researchProductivityTime", b."wasteFactor", b."productTypeID"
+                        b."researchProductivityTime", b."wasteFactor", b."productTypeID",
+                        COALESCE(i."materialLevel", 0), COALESCE(i."productivityLevel", 0),
+                        COALESCE(i."copy", 0), COALESCE(i."licensedProductionRunsRemaining", -1)
                    FROM entity e
                    JOIN "invBlueprintTypes" b ON b."blueprintTypeID" = e."typeID"
+                   LEFT JOIN "invBlueprints" i ON i."itemID" = e."itemID"
                   WHERE e."itemID" = $1"#;
     let Some(r) = ctx.query_one(sql, &[&(item_id as i32)]).await else { return Value::None };
     let num = |i: usize| Value::Int(int(&r, i).unwrap_or(0));
@@ -80,10 +84,10 @@ async fn blueprint_attributes(ctx: &Ctx<'_>, item_id: i64) -> Value {
         ("researchProductivityTime", num(3)),
         ("wastageFactor", Value::Double(float(&r, 4).unwrap_or(0.0) / 100.0)),
         ("productTypeID", num(5)),
-        ("materialLevel", Value::Int(0)),
-        ("productivityLevel", Value::Int(0)),
-        ("copy", Value::Int(0)),
-        ("licensedProductionRunsRemaining", Value::Int(-1)),
+        ("materialLevel", num(6)),
+        ("productivityLevel", num(7)),
+        ("copy", num(8)),
+        ("licensedProductionRunsRemaining", num(9)),
     ];
     Value::Dict(pairs.into_iter().map(|(k, v)| (Value::bytes(k), v)).collect())
 }

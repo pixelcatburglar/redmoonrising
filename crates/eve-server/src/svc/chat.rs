@@ -112,6 +112,8 @@ pub async fn lsc(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
         "AccessControl" => access_control(ctx, call).await,
 
         "GetMessageDetails" => message_details(ctx, call.arg_id(0), call.arg_id(1)).await,
+        // Invite(otherID, channelID, channelName, addAllowed) (lscengine.py:1057).
+        "Invite" => return Some(invite(ctx, call).await),
         // Page(destinations, subject, body, attachments=None) (newmessage.py:173).
         "Page" => return Some(page(ctx, call).await),
 
@@ -178,6 +180,55 @@ async fn page(ctx: &Ctx<'_>, call: &Call) -> Outcome {
             Outcome::custom("Your mail could not be sent.")
         }
     }
+}
+
+/// How long an invitee has to answer before the invitation lapses quietly.
+const INVITE_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Asks the invitee's client (LSC.ChatInvite(invitorID, invitorName,
+/// invitorGender, channelID), lscengine.py:1411) and returns at once: the
+/// invitee may take minutes to decide. Their refusal, a message key, reaches
+/// the inviter as OnRemoteMessage(key, {char, channel}). With addAllowed the
+/// invitee is let into the channel first.
+async fn invite(ctx: &Ctx<'_>, call: &Call) -> Outcome {
+    let me = ctx.session.char_id.unwrap_or(0);
+    let (other, channel_id) = (call.arg_id(0), call.args.get(1).cloned().unwrap_or(Value::None));
+    let channel_name = call.arg_text(2).unwrap_or_default();
+    let add_allowed = call.arg_i64(3).unwrap_or(0) != 0;
+    let names = r#"SELECT (SELECT "characterName" FROM "character_" WHERE "characterID" = $1),
+                          (SELECT "characterName" FROM "character_" WHERE "characterID" = $2),
+                          (SELECT "gender" FROM "character_" WHERE "characterID" = $1)"#;
+    let row = ctx.query_one(names, &[&(me as i32), &(other as i32)]).await;
+    let name = |i| row.as_ref().and_then(|r| text(r, i)).unwrap_or_default();
+    let (my_name, other_name) = (name(0), name(1));
+    let gender = row.as_ref().and_then(|r| int(r, 2)).unwrap_or(1);
+    let char_arg = |key: &str| Outcome::UserError { msg: key.into(), args: vec![("char".into(), Value::text(&other_name))] };
+    if other == me {
+        return char_arg("ChtCannotInviteSelf");
+    }
+    let target = ctx.world.lock().clients_of(other).first().copied();
+    let Some(target) = target else { return char_arg("ChtCharNotReachable") };
+    if let (true, Some(id)) = (add_allowed, channel_id.as_i64()) {
+        let sql = r#"INSERT INTO "channelMods" ("channelID", "accessor", "mode")
+                     SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM "channelMods" WHERE "channelID" = $1 AND "accessor" = $2)"#;
+        ctx.execute(sql, &[&(id as i32), &(other as i32), &(CHTMODE_CONVERSATIONALIST as i32)]).await;
+    }
+    let args = vec![Value::Int(me), Value::text(&my_name), Value::Int(gender), channel_id.clone()];
+    let Some(answer) = ctx.world.lock().call(target, "LSC", "ChatInvite", args) else { return char_arg("ChtCharNotReachable") };
+    tracing::info!("{me} invited {other} to channel {channel_id:?}");
+    let (world, inviter) = (ctx.world.clone(), ctx.client_id);
+    tokio::spawn(async move {
+        let reason = match tokio::time::timeout(INVITE_WAIT, answer).await {
+            Ok(Ok(Some(Value::None))) | Err(_) => return,
+            Ok(Ok(Some(v))) => v.as_string().unwrap_or_else(|| "ChtInviteException".into()),
+            Ok(Ok(None)) | Ok(Err(_)) => "ChtInviteException".into(),
+        };
+        tracing::info!("{other} did not take the invitation to {channel_id:?}: {reason}");
+        let dict = Value::Dict(vec![(Value::bytes("char"), Value::text(other_name)), (Value::bytes("channel"), Value::text(channel_name))]);
+        let w = world.lock();
+        w.notify(&[inviter], "OnRemoteMessage", Value::Tuple(vec![Value::text(reason), dict]));
+    });
+    Outcome::Value(Value::None)
 }
 
 /// Puts a mail in each mailbox and tells whoever is online to look:

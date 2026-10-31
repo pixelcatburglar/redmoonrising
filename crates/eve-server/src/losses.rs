@@ -318,7 +318,7 @@ async fn lose_implants(txn: &mut ItemTxn<'_>, char_id: i64) -> Result<Vec<String
 }
 
 /// Skill points a skill of `rank * 250` time constant has at `level`.
-fn points_at(time_constant: f64, level: i64) -> f64 {
+pub(crate) fn points_at(time_constant: f64, level: i64) -> f64 {
     if level <= 0 { 0.0 } else { time_constant * 2f64.powf(2.5 * (level - 1) as f64) }
 }
 

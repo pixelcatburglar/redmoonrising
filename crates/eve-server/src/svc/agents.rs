@@ -1,7 +1,7 @@
 use eve_marshal::Value;
 
 use crate::services::{Call, Ctx, Outcome};
-use crate::svc::bound;
+use crate::svc::{agent_missions, bound};
 use crate::svc::rows::{int, key_val};
 
 const HEADER: &[&str] =
@@ -16,18 +16,23 @@ const SQL: &str = r#"SELECT a."agentID",a."divisionID",a."corporationID",a."stat
                        LEFT JOIN "character_" c ON c."characterID" = a."agentID"
                       ORDER BY a."agentID""#;
 
-/// The conversation's one dialogue choice (action IDs are the server's own).
-const ASK_FOR_WORK: i64 = 1;
-
 pub async fn agent_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     let value = match call.method.as_str() {
         "GetAgents" => get_agents(ctx).await,
-        "GetMyJournalDetails" => my_journal_details(),
+        // All the pilot's missions, or (bound) one agent's.
+        "GetMyJournalDetails" => agent_missions::journal(ctx, agent_of(call)).await,
         // Bound per agent: moniker.GetAgent(agentID) (moniker.py:530).
-        "DoAction" => do_action(ctx, action_id(call)),
+        "DoAction" => agent_missions::conversation(ctx, agent_of(call)?, action_id(call)).await,
         "GetInfoServiceDetails" => info_service_details(ctx, agent_of(call)?).await,
-        // No missions yet, so no journal pages; agents.py opens nothing on None.
-        "GetMissionJournalInfo" | "GetOfferJournalInfo" => Value::None,
+        "GetMissionJournalInfo" => agent_missions::mission_page(ctx, agent_of(call)?).await,
+        // Offers are the loyalty point store's, which there is none of.
+        "GetOfferJournalInfo" => Value::None,
+        // (locationType, locationNumber, warpRange, gang) (menusvc.py:1663).
+        "WarpToLocation" => {
+            let range = call.args.get(2).and_then(|v| v.as_f64()).unwrap_or(15_000.0);
+            return Some(agent_missions::go_to(ctx, call.arg_id(1), range, false).await);
+        }
+        "GotoLocation" => return Some(agent_missions::go_to(ctx, call.arg_id(1), 0.0, true).await),
         _ => return None,
     };
     Some(Outcome::Value(value))
@@ -41,34 +46,6 @@ fn agent_of(call: &Call) -> Option<i64> {
 /// pass the ID back as text (agents.py:273), so accept either form.
 fn action_id(call: &Call) -> Option<i64> {
     call.arg_i64(0).or_else(|| call.arg_text(0)?.trim().parse().ok())
-}
-
-/// ((agentSays, [(actionID, choiceText)]), oob), unpacked by
-/// agents.py __GetConversation. There is no mission engine yet, so every agent
-/// has the same short exchange.
-fn do_action(ctx: &Ctx<'_>, action: Option<i64>) -> Value {
-    let (says, choices) = match action {
-        Some(ASK_FOR_WORK) => (
-            "I'm sorry, I don't have any work for you at the moment. Check back with me later."
-                .to_owned(),
-            Vec::new(),
-        ),
-        _ => (
-            format!("Hello, {}. What can I do for you?", html_escape(&ctx.session.char_name)),
-            vec![Value::Tuple(vec![
-                Value::Int(ASK_FOR_WORK),
-                Value::text("Do you have any work for me?"),
-            ])],
-        ),
-    };
-    Value::Tuple(vec![
-        Value::Tuple(vec![Value::text(says), Value::List(choices)]),
-        Value::Dict(Vec::new()),
-    ])
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 /// The agent's Show Info panel (infosvc.py:1404-1429). Effective quality is the
@@ -85,14 +62,6 @@ async fn info_service_details(ctx: &Ctx<'_>, agent_id: i64) -> Value {
         ("loyaltyPoints", Value::Int(0)),
         ("services", Value::List(Vec::new())),
         ("incompatible", Value::None),
-    ])
-}
-
-fn my_journal_details() -> Value {
-    Value::List(vec![
-        Value::List(Vec::new()),
-        Value::List(Vec::new()),
-        Value::List(Vec::new()),
     ])
 }
 

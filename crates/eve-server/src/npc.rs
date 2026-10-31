@@ -523,21 +523,10 @@ fn tier(security: f64, len: usize) -> std::ops::Range<usize> {
 }
 
 fn spawn(park: &mut Park, belt_index: usize, now: i64, out: &mut Out) {
-    let wildlife = std::sync::Arc::clone(&park.wildlife);
     let belt_id = park.belts[belt_index].id;
     let centre = park.belts[belt_index].pos;
-    let mut ids = Vec::new();
-    for class in plan(wildlife.security, &mut park.rng) {
-        // A class this faction has none of falls back to the next smaller one.
-        let index = CLASSES.iter().position(|c| *c == class).unwrap_or(0);
-        let Some(list) = (0..=index).rev().map(|i| &wildlife.rats[i]).find(|l| !l.is_empty()) else { continue };
-        let range = tier(wildlife.security, list.len());
-        let t = &list[range.start + park.rng.below(range.len())];
-        let offset = park.rng.in_sphere(20_000.0);
-        let rat = make_rat(t, &wildlife, belt_id, centre + Vec3::new(offset.x, offset.y * 0.2, offset.z), now, &mut park.rng);
-        ids.push(rat.id);
-        park.ships.insert(rat.id, rat);
-    }
+    let security = park.wildlife.security;
+    let ids = spawn_group(park, belt_id, centre, security, now);
     park.belts[belt_index].rats = ids.clone();
     if ids.is_empty() {
         // Nothing to spawn here; do not try again every pulse.
@@ -550,6 +539,26 @@ fn spawn(park: &mut Park, belt_index: usize, now: i64, out: &mut Out) {
             out.destiny(park.solar_system_id, e);
         }
     }
+}
+
+/// A group of rats about `anchor` (a belt, or a mission site), as strong as
+/// `security` calls for; returns their IDs. They are in the park but not yet
+/// shown to anyone.
+pub fn spawn_group(park: &mut Park, anchor: i64, centre: Vec3, security: f64, now: i64) -> Vec<i64> {
+    let wildlife = std::sync::Arc::clone(&park.wildlife);
+    let mut ids = Vec::new();
+    for class in plan(security, &mut park.rng) {
+        // A class this faction has none of falls back to the next smaller one.
+        let index = CLASSES.iter().position(|c| *c == class).unwrap_or(0);
+        let Some(list) = (0..=index).rev().map(|i| &wildlife.rats[i]).find(|l| !l.is_empty()) else { continue };
+        let range = tier(security, list.len());
+        let t = &list[range.start + park.rng.below(range.len())];
+        let offset = park.rng.in_sphere(20_000.0);
+        let rat = make_rat(t, &wildlife, anchor, centre + Vec3::new(offset.x, offset.y * 0.2, offset.z), now, &mut park.rng);
+        ids.push(rat.id);
+        park.ships.insert(rat.id, rat);
+    }
+    ids
 }
 
 fn make_rat(t: &NpcType, wildlife: &Wildlife, belt: i64, pos: Vec3, now: i64, rng: &mut combat::Rng) -> Ship {
@@ -956,8 +965,12 @@ fn disengage(park: &mut Park, id: i64, now: i64, out: &mut Out) {
 }
 
 /// A rat died: its belt starts the clock on a new spawn once it is empty.
-pub fn killed(park: &mut Park, ship: &Ship, now: i64) {
+pub fn killed(park: &mut Park, ship: &Ship, now: i64, out: &mut Out) {
     let Some(brain) = &ship.npc else { return };
+    if let Some((mission_id, char_id)) = crate::sites::rat_killed(park, brain.belt, ship.id) {
+        out.jobs.push(crate::heartbeat::Job::SiteCleared { mission_id, char_id });
+        return;
+    }
     let Some(belt) = park.belts.iter_mut().find(|b| b.id == brain.belt) else { return };
     belt.rats.retain(|r| *r != ship.id);
     if belt.rats.is_empty() {

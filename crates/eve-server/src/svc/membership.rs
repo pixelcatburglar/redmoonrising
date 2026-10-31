@@ -156,8 +156,9 @@ async fn add_corporation(ctx: &Ctx<'_>, call: &Call) -> Refused<Value> {
     tx.execute(r#"UPDATE "corporation" SET "shares" = $2 WHERE "corporationID" = $1"#, &[&corp_id, &i64::from(FOUNDER_SHARES)])
         .await
         .map_err(|e| db_failed("recording the shares", e))?;
-    change_corporation(&tx, char_id, i64::from(corp_id), ALL_ROLES, now).await?;
+    let left = change_corporation(&tx, char_id, i64::from(corp_id), ALL_ROLES, now).await?;
     tx.commit().await.map_err(|e| db_failed("COMMIT", e))?;
+    member_moved(ctx.world, char_id, left, i64::from(corp_id));
 
     info!("founded corporation {name:?} [{ticker}] ({corp_id}) at station {station_id}, member limit {member_limit}");
     let world = ctx.world.lock();
@@ -306,6 +307,7 @@ async fn answer_offer(ctx: &Ctx<'_>, corp_id: i64, note: &str, status: i16) -> R
     tx.commit().await.map_err(|e| db_failed("COMMIT", e))?;
 
     info!("{char_id} left corporation {left} and joined {corp_id}");
+    member_moved(ctx.world, char_id, left, corp_id);
     tell_application(ctx, corp_id, char_id, change(APPLICATION_HEADER, Some(&old), Some(&new)));
     ctx.world.lock().reaffiliate(&[], &[char_id]);
     Ok(Value::None)
@@ -418,6 +420,7 @@ pub async fn kick_out(ctx: &Ctx<'_>, char_id: i64) -> Refused<Value> {
         .ok_or_else(|| Outcome::custom("There is no NPC corporation for them to go back to."))?;
     change_corporation(&tx, char_id, home, 0, crate::bulkdata::filetime_now()).await?;
     tx.commit().await.map_err(|e| db_failed("COMMIT", e))?;
+    member_moved(ctx.world, char_id, corp_id, home);
 
     if own {
         info!("{char_id} quit corporation {corp_id} for {home}");
@@ -576,6 +579,19 @@ pub async fn change_corporation(tx: &Transaction<'_>, char_id: i64, corp_id: i64
     .await
     .map_err(|e| db_failed("setting the roles", e))?;
     Ok(old_corp)
+}
+
+/// Tells both corporations' members, and the character, that they moved, so
+/// open member lists follow (bco_members.py:170). Called after the commit.
+pub fn member_moved(world: &crate::world::World, char_id: i64, old_corp: i64, new_corp: i64) {
+    let w = world.lock();
+    let mut clients: Vec<i64> = w.corp_members(old_corp);
+    clients.extend(w.corp_members(new_corp));
+    clients.extend(w.clients_of(char_id));
+    clients.sort_unstable();
+    clients.dedup();
+    let change = Value::Dict(vec![(Value::bytes("corporationID"), Value::Tuple(vec![Value::Int(old_corp), Value::Int(new_corp)]))]);
+    w.notify(&clients, "OnCorporationMemberChanged", Value::Tuple(vec![Value::Int(char_id), change]));
 }
 
 /// Whether the character is the CEO of a player corporation.

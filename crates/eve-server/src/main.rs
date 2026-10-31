@@ -10,6 +10,7 @@ mod drones;
 mod dogma;
 mod exceptions;
 mod fight;
+mod gates;
 mod guard;
 mod heartbeat;
 mod items;
@@ -20,6 +21,7 @@ mod npc;
 mod pos;
 mod services;
 mod session;
+mod sites;
 mod svc;
 mod world;
 

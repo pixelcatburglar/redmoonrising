@@ -75,6 +75,9 @@ pub struct Conn {
     session: Session,
     authenticated: bool,
     pending_session_change: Option<MachoPacket>,
+    /// Calls made on the client, by call ID, waiting for its answer.
+    client_calls: std::collections::HashMap<i64, tokio::sync::oneshot::Sender<Option<Value>>>,
+    next_call_id: i64,
 }
 
 impl Conn {
@@ -97,6 +100,8 @@ impl Conn {
             session: Session::new(seq),
             authenticated: false,
             pending_session_change: None,
+            client_calls: std::collections::HashMap::new(),
+            next_call_id: 0,
         }
     }
 
@@ -132,6 +137,7 @@ impl Conn {
                     match push {
                         Push::Notify(n) => self.send_notification(&n).await?,
                         Push::Move(m) => self.forced_move(m).await?,
+                        Push::Call(c) => self.call_client(c).await?,
                     }
                     continue;
                 }
@@ -199,6 +205,10 @@ impl Conn {
                 self.send_packet(&rsp).await
             }
             MessageType::CallReq => self.service_call(packet).await,
+            MessageType::CallRsp | MessageType::ErrorResponse => {
+                self.client_answered(&packet);
+                Ok(())
+            }
             MessageType::Notification => {
                 self.client_notification(&packet);
                 Ok(())
@@ -283,6 +293,52 @@ impl Conn {
         self.flush_pending_session_change(&call.service).await
     }
 
+    /// Calls one of the client's services, as a client calls ours:
+    /// (0, marshal((1, method, args, kwargs))) to the service, from this node.
+    async fn call_client(&mut self, c: crate::world::ClientCall) -> Result {
+        self.next_call_id += 1;
+        let call_id = self.next_call_id;
+        let inner = Value::Tuple(vec![Value::Int(1), Value::bytes(c.method), Value::Tuple(c.args), Value::Dict(Vec::new())]);
+        let blob = eve_marshal::save(&inner, &self.server.table)?;
+        let mut req = MachoPacket::call_req(Value::Tuple(vec![Value::Int(0), Value::Bytes(blob)]));
+        req.source = Some(MachoAddress::Node { node_id: Some(self.server.node_id), service: None, call_id: Some(call_id) });
+        req.destination = Some(MachoAddress::Client { client_id: Some(self.client_id), call_id: None, service: Some(c.service.as_bytes().to_vec()) });
+        req.user_id = self.session.user_id;
+        debug!(svc = c.service, method = c.method, call_id, "calling the client");
+        self.client_calls.insert(call_id, c.reply);
+        self.send_packet(&req).await
+    }
+
+    /// The client's answer to one of our calls: its return value, or None if
+    /// it raised.
+    fn client_answered(&mut self, packet: &MachoPacket) {
+        let call_id = match &packet.destination {
+            Some(MachoAddress::Node { call_id, .. }) | Some(MachoAddress::Any { call_id, .. }) => *call_id,
+            _ => None,
+        };
+        let Some(reply) = call_id.and_then(|id| self.client_calls.remove(&id)) else {
+            warn!("{} for a call the server did not make", packet.command.name());
+            return;
+        };
+        let value = match (packet.command, packet.body.first()) {
+            (MessageType::CallRsp, Some(Value::Bytes(b) | Value::MarshalStream(b) | Value::Buffer(b))) => {
+                match eve_marshal::load(b, &self.server.table) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!("unreadable answer from the client: {}", crate::logging::chain(&e));
+                        None
+                    }
+                }
+            }
+            (MessageType::CallRsp, v) => v.cloned(),
+            _ => {
+                info!("the client raised in answer to call {call_id:?}");
+                None
+            }
+        };
+        let _ = reply.send(value);
+    }
+
     fn client_notification(&self, packet: &MachoPacket) {
         let inner = packet
             .body
@@ -364,6 +420,7 @@ impl Conn {
             solar_system_id: self.session.solar_system_id2?,
             docked: self.session.station_id.is_some(),
             station_id: self.session.station_id,
+            role: self.session.role,
         })
     }
 

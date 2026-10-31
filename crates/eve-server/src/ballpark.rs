@@ -293,6 +293,8 @@ pub struct Park {
     pub cans: BTreeMap<i64, crate::loot::Can>,
     /// Starbase structures, by item ID.
     pub structures: BTreeMap<i64, crate::pos::Structure>,
+    /// Agents' mission sites, by beacon ID.
+    pub sites: BTreeMap<i64, crate::sites::Site>,
     /// Aggression and crime here.
     pub watch: crate::concord::Watch,
     pub belts: Vec<Belt>,
@@ -313,6 +315,7 @@ impl Park {
             rocks: BTreeMap::new(),
             cans: BTreeMap::new(),
             structures: BTreeMap::new(),
+            sites: BTreeMap::new(),
             watch: Default::default(),
             belts: Vec::new(),
             missiles: Vec::new(),
@@ -338,6 +341,9 @@ impl Park {
         }
         if let Some(s) = self.structures.get(&id) {
             return Some((s.pos, s.radius));
+        }
+        if let Some(s) = self.sites.get(&id) {
+            return Some((s.pos, s.radius()));
         }
         self.celestial(id).map(|c| (c.pos, c.radius))
     }
@@ -436,6 +442,7 @@ impl Park {
             .chain(self.rocks.values().map(|r| (r.id, (r.pos, r.radius))))
             .chain(self.cans.values().map(|c| (c.id, (c.pos, c.radius))))
             .chain(self.structures.values().map(|s| (s.id, (s.pos, s.radius))))
+            .chain(self.sites.values().map(|s| (s.id, (s.pos, s.radius()))))
             .chain(self.celestials.iter().map(|c| (c.id, (c.pos, c.radius))))
             .collect();
         let mut thrust = BTreeMap::new();

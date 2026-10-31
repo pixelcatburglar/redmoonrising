@@ -116,6 +116,8 @@ pub enum Job {
     DroneHome { client_id: i64, drone_id: i64, ship_id: i64 },
     /// A drone was destroyed.
     DroneLost { client_id: Option<i64>, drone_id: i64 },
+    /// The last rat of a mission site died.
+    SiteCleared { mission_id: i64, char_id: i64 },
     /// A crime, or a kill, changed a pilot's security status by this much.
     Security { char_id: i64, delta: f64 },
     /// A starbase structure's health after a fight.
@@ -199,6 +201,7 @@ async fn perform(server: &Server, db: &mut Client, job: Job) {
         Job::DroneHome { client_id, drone_id, ship_id } => crate::drones::home(server, db, client_id, drone_id, ship_id).await,
         Job::DroneLost { client_id, drone_id } => crate::drones::lost(server, db, client_id, drone_id).await,
         Job::Security { char_id, delta } => change_security(db, char_id, delta).await,
+        Job::SiteCleared { mission_id, char_id } => crate::svc::agent_missions::site_cleared(&server.world, db, mission_id, char_id).await,
         Job::Structure { id, state, stamp, tower } => save_structure(db, id, state, stamp, tower).await,
         Job::StructureDamage { id, shield, armor, hull } => crate::svc::starbase::save_damage(db, id, shield, armor, hull).await,
         Job::Reinforce { system, tower } => crate::svc::starbase::reinforce(&server.world, db, system, tower).await,
