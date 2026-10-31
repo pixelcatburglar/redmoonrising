@@ -7,8 +7,9 @@
 //!   for about every 25 pilots. Their claims are dated back past the claim
 //!   delay, so the map shows the space held from the start.
 //! - Upkeep (`upkeep`, every politics tick): towers are kept in 30 days of
-//!   fuel and some strontium. Neighbours at war besiege each other's border
-//!   systems where nobody is watching: a siege that succeeds destroys the
+//!   fuel and some strontium. Neighbours at war plan sieges of each other's
+//!   border systems, announced in the news `SIEGE_NOTICE` ahead
+//!   (`battle` fights them). A siege that succeeds (`conclude`) destroys the
 //!   defender's towers there and anchors the attacker's, whose claim then
 //!   stands its delay (scaled by the bots' clock) before the system changes
 //!   hands. An alliance short of systems at home anchors in unclaimed ones.
@@ -42,12 +43,43 @@ const PURPOSE_ONLINE: i32 = 1;
 const PURPOSE_REINFORCE: i32 = 4;
 /// Each war's chance, per politics tick, of a siege.
 const SIEGE_CHANCE: f64 = 0.03;
+/// How long before a siege it is announced, in seconds of the bots' clock.
+pub const SIEGE_NOTICE: u32 = 15 * 60;
 /// An alliance's chance, per tick, to anchor in an unclaimed home system.
 const EXPAND_CHANCE: f64 = 0.05;
 const SECOND_FT: i64 = 10_000_000;
 
 /// What happened, for the news.
 pub type News = (i64, String);
+
+/// A siege planned or under way: who, where, and when it begins.
+pub struct Siege {
+    pub war: i32,
+    pub attacker: i32,
+    pub defender: i32,
+    /// The attacker's executor corporation and its race, for its tower.
+    pub attacker_exec: i32,
+    pub attacker_race: i64,
+    /// Pilots in each alliance, for the odds when nobody watches.
+    pub attackers: u32,
+    pub defenders: u32,
+    pub system: i32,
+    pub names: SiegeNames,
+    /// When it begins: on the bots' clock, and as FILETIME for the dashboard.
+    pub starts: u32,
+    pub starts_at: i64,
+    /// The fleets, once it is fought where someone watches.
+    pub fight: Option<super::battle::Fight>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SiegeNames {
+    pub attacker: String,
+    pub defender: String,
+    pub system: String,
+    pub region: String,
+    pub security: f64,
+}
 
 struct Place {
     system: i32,
@@ -193,10 +225,21 @@ pub async fn refuel(db: &Client) -> Result<u64, tokio_postgres::Error> {
     db.execute(sql, &[&PURPOSE_ONLINE, &PURPOSE_REINFORCE, &FUEL_PERIODS, &STRONTIUM]).await
 }
 
-/// Every politics tick: fuel, sieges between warring neighbours, and
-/// expansion into empty home systems. Returns the news.
+/// Every politics tick: fuel, sieges planned between warring neighbours
+/// (added to `sieges`), and expansion into empty home systems. Returns the
+/// news.
 #[allow(clippy::too_many_arguments)]
-pub async fn upkeep(db: &Client, atlas: &Atlas, p: &mut Politics, watched: &HashSet<i32>, rng: &mut Rng, claim_delay_secs: i64, speed: f64) -> Result<Vec<News>, tokio_postgres::Error> {
+pub async fn upkeep(
+    db: &Client,
+    atlas: &Atlas,
+    p: &mut Politics,
+    watched: &HashSet<i32>,
+    sieges: &mut Vec<Siege>,
+    rng: &mut Rng,
+    clock: u32,
+    claim_delay_secs: i64,
+    speed: f64,
+) -> Result<Vec<News>, tokio_postgres::Error> {
     refuel(db).await?;
     let now = crate::bulkdata::filetime_now();
     // A new claim waits out the delay, run at the bots' speed.
@@ -217,15 +260,15 @@ pub async fn upkeep(db: &Client, atlas: &Atlas, p: &mut Politics, watched: &Hash
     }
     let has = |towers: &HashMap<i32, HashSet<i32>>, system: &i32, alliance: i32| towers.get(system).is_some_and(|t| t.contains(&alliance));
 
-    // Sieges.
-    let wars: Vec<(i32, i32, usize)> = p.wars.iter().enumerate().map(|(n, w)| (w.a, w.b, n)).collect();
-    for (a, b, n) in wars {
+    // Sieges: one at a time in each war, announced ahead.
+    let wars: Vec<(i32, i32, i32)> = p.wars.iter().map(|w| (w.a, w.b, w.id)).collect();
+    for (a, b, war) in wars {
         let (Some(&(_, attacker_exec, attacker_race, attackers)), Some(&(_, _, _, defenders))) = (info.get(&a), info.get(&b)) else { continue };
-        if rng.unit() >= SIEGE_CHANCE {
+        if sieges.iter().any(|s| s.war == war) || rng.unit() >= SIEGE_CHANCE {
             continue;
         }
         // A defender's system next to the attacker's space, else any of theirs.
-        let mut theirs: Vec<i32> = towers.keys().copied().filter(|s| has(&towers, s, b) && !watched.contains(s)).collect();
+        let mut theirs: Vec<i32> = towers.keys().copied().filter(|s| has(&towers, s, b) && !sieges.iter().any(|x| x.system == *s)).collect();
         theirs.sort_unstable();
         let border: Vec<i32> = theirs
             .iter()
@@ -234,26 +277,30 @@ pub async fn upkeep(db: &Client, atlas: &Atlas, p: &mut Politics, watched: &Hash
             .collect();
         let pool = if border.is_empty() { &theirs } else { &border };
         let Some(&target) = pool.get(rng.below(pool.len().max(1))) else { continue };
-        let odds = attackers as f64 / (attackers + defenders).max(1) as f64;
-        let won = rng.unit() < odds;
-        let (lost_a, lost_d) = if won { (1 + rng.below(4), 3 + rng.below(8)) } else { (3 + rng.below(8), 1 + rng.below(4)) };
-        p.wars[n].kills += (lost_a + lost_d) as u32;
-        p.lost += (lost_a + lost_d) as u64;
-        let (an, dn, sys) = (alliance_name(db, a).await, alliance_name(db, b).await, system_name(db, target).await);
-        if !won {
-            news.push((now, format!("{an} were driven back from {sys} by {dn}")));
-            continue;
-        }
-        let gone = destroy_towers(db, target, b).await?;
-        let there = towers.entry(target).or_default();
-        there.remove(&b);
-        let tower_type = TOWERS.iter().find(|(r, _)| *r == attacker_race).map_or(TOWERS[2].1, |(_, t)| *t);
-        if let Some(place) = spot(db, target, rng).await? {
-            anchor(db, attacker_exec, tower_type, &place, claim_since).await?;
-            there.insert(a);
-        }
-        info!("bots: {an} besieged {sys}: {gone} tower(s) of {dn} destroyed");
-        news.push((now, format!("{an} destroyed {dn}'s towers in {sys} and anchored their own")));
+        let names = SiegeNames {
+            attacker: alliance_name(db, a).await,
+            defender: alliance_name(db, b).await,
+            system: system_name(db, target).await,
+            region: region_name(db, atlas.systems.get(&target).map_or(0, |x| x.region)).await,
+            security: atlas.systems.get(&target).map_or(0.0, |x| x.security as f64),
+        };
+        let starts_at = now + (SIEGE_NOTICE as f64 / speed.max(0.001)) as i64 * SECOND_FT;
+        info!("bots: {} will besiege {} ({}) of {}", names.attacker, names.system, names.region, names.defender);
+        news.push((now, format!("{} are massing a fleet to besiege {} in {}, held by {}", names.attacker, names.system, names.region, names.defender)));
+        sieges.push(Siege {
+            war,
+            attacker: a,
+            defender: b,
+            attacker_exec,
+            attacker_race,
+            attackers,
+            defenders,
+            system: target,
+            names,
+            starts: clock + SIEGE_NOTICE,
+            starts_at,
+            fight: None,
+        });
     }
 
     // Expansion into empty home systems.
@@ -284,6 +331,78 @@ pub async fn upkeep(db: &Client, atlas: &Atlas, p: &mut Politics, watched: &Hash
     Ok(news)
 }
 
+/// How a siege ended: `won` by the attacker or not, with `lost` ships on
+/// each side. A won siege destroys the defender's towers in the system and
+/// anchors the attacker's, its claim to stand the delay (scaled by the bots'
+/// clock). Returns the news.
+#[allow(clippy::too_many_arguments)]
+pub async fn conclude(
+    db: &Client,
+    p: &mut Politics,
+    s: &Siege,
+    won: bool,
+    lost: (u32, u32),
+    rng: &mut Rng,
+    claim_delay_secs: i64,
+    speed: f64,
+) -> Result<News, tokio_postgres::Error> {
+    let now = crate::bulkdata::filetime_now();
+    if let Some(w) = p.wars.iter_mut().find(|w| w.id == s.war) {
+        w.kills += lost.0 + lost.1;
+    }
+    p.lost += (lost.0 + lost.1) as u64;
+    let n = &s.names;
+    if !won {
+        info!("bots: {} driven back from {} by {} ({} and {} ships lost)", n.attacker, n.system, n.defender, lost.0, lost.1);
+        return Ok((now, format!("{} were driven back from {} by {}", n.attacker, n.system, n.defender)));
+    }
+    let gone = destroy_towers(db, s.system, s.defender).await?;
+    let delay = claim_delay_secs as f64;
+    let claim_since = now - ((delay - delay / speed.max(1.0)) as i64) * SECOND_FT;
+    let tower_type = TOWERS.iter().find(|(r, _)| *r == s.attacker_race).map_or(TOWERS[2].1, |(_, t)| *t);
+    if let Some(place) = spot(db, s.system, rng).await? {
+        anchor(db, s.attacker_exec, tower_type, &place, claim_since).await?;
+        refuel(db).await?;
+    }
+    info!("bots: {} besieged {}: {gone} tower(s) of {} destroyed", n.attacker, n.system, n.defender);
+    Ok((now, format!("{} destroyed {}'s towers in {} and anchored their own", n.attacker, n.defender, n.system)))
+}
+
+/// Brings a system's park up to date with its towers after a siege: the
+/// destroyed ones explode, the new one appears.
+pub async fn show_towers(db: &Client, world: &crate::world::World, system: i32) {
+    let loaded = match crate::pos::load(db, system as i64).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("bots: reading the towers of {system}: {}", crate::logging::chain(&e));
+            return;
+        }
+    };
+    let mut w = world.lock();
+    let Some(park) = w.parks.get_mut(&(system as i64)) else { return };
+    park.advance(crate::destiny::tick_now());
+    let tick = park.tick;
+    let mut entries = Vec::new();
+    let gone: Vec<i64> = park.structures.keys().copied().filter(|id| !loaded.iter().any(|s| s.id == *id)).collect();
+    for id in gone {
+        let Some(s) = park.structures.remove(&id) else { continue };
+        entries.push(crate::svc::space::entry(tick, "TerminalExplosion", vec![eve_marshal::Value::Int(id)]));
+        let mut balls = vec![eve_marshal::Value::Int(id)];
+        if let Some(f) = &s.field {
+            balls.push(eve_marshal::Value::Int(f.id));
+        }
+        entries.push(crate::svc::space::entry(tick, "RemoveBalls", vec![eve_marshal::Value::List(balls)]));
+    }
+    for s in loaded {
+        if !park.structures.contains_key(&s.id) {
+            // Its force field goes up with the next pulse (`pos::step`).
+            entries.push(crate::pos::add_entry(tick, &s));
+            park.structures.insert(s.id, s);
+        }
+    }
+    crate::svc::space::broadcast(&w, system as i64, None, entries);
+}
+
 /// Destroys an alliance's towers (and what they hold) in a system.
 async fn destroy_towers(db: &Client, system: i32, alliance: i32) -> Result<u64, tokio_postgres::Error> {
     let towers: Vec<i32> = db
@@ -305,12 +424,12 @@ async fn destroy_towers(db: &Client, system: i32, alliance: i32) -> Result<u64, 
     db.execute(r#"DELETE FROM entity WHERE "itemID" = ANY($1)"#, &[&towers]).await
 }
 
-async fn alliance_name(db: &Client, id: i32) -> String {
+pub async fn alliance_name(db: &Client, id: i32) -> String {
     let sql = r#"SELECT "allianceName" FROM alliances WHERE "allianceID" = $1"#;
     db.query_opt(sql, &[&id]).await.ok().flatten().and_then(|r| text(&r, 0)).unwrap_or_else(|| id.to_string())
 }
 
-async fn system_name(db: &Client, id: i32) -> String {
+pub async fn system_name(db: &Client, id: i32) -> String {
     let sql = r#"SELECT "solarSystemName" FROM "mapSolarSystems" WHERE "solarSystemID" = $1"#;
     db.query_opt(sql, &[&id]).await.ok().flatten().and_then(|r| text(&r, 0)).unwrap_or_else(|| id.to_string())
 }

@@ -226,7 +226,7 @@ pub struct Ship {
     warp: Option<WarpState>,
     /// Hit points, locks and running modules; None for a ship that cannot fight.
     pub fight: Option<Fighter>,
-    /// What an NPC thinks; None for a player's ship.
+    /// What an NPC thinks, or how a bot fights; None for a player's ship.
     pub npc: Option<Brain>,
     /// A player's drone: whose, and what it was told to do.
     pub drone: Option<crate::drones::Drone>,
@@ -274,12 +274,18 @@ impl Ship {
 
     /// A ship a connected player flies.
     pub fn is_player(&self) -> bool {
-        self.npc.is_none() && self.drone.is_none() && !self.bot
+        self.is_pilot() && !self.bot
     }
 
-    /// A ship with a character at the helm: a player's or a bot's.
+    /// A ship with a character at the helm: a player's or a bot's (a bot's
+    /// fights with an NPC's brain, but is flown by a character all the same).
     pub fn is_pilot(&self) -> bool {
-        self.npc.is_none() && self.drone.is_none()
+        (self.npc.is_none() || self.bot) && self.drone.is_none()
+    }
+
+    /// An NPC: a rat, CONCORD, a mission's enemies.
+    pub fn is_npc(&self) -> bool {
+        self.npc.is_some() && !self.bot
     }
 
     /// Whether others bounce off it: always, but not in warp.
@@ -312,6 +318,9 @@ pub struct Park {
     /// each ejected in (None: it was the capsule), for the bot simulation to
     /// collect.
     pub bot_losses: Vec<(i64, Option<i64>)>,
+    /// Starbases under attack since the bots last looked: (tower, the
+    /// attacking ship), for their owners to answer.
+    pub tower_alarms: Vec<(i64, i64)>,
     /// Aggression and crime here.
     pub watch: crate::concord::Watch,
     pub belts: Vec<Belt>,
@@ -334,6 +343,7 @@ impl Park {
             structures: BTreeMap::new(),
             sites: BTreeMap::new(),
             bot_losses: Vec::new(),
+            tower_alarms: Vec::new(),
             watch: Default::default(),
             belts: Vec::new(),
             missiles: Vec::new(),

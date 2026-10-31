@@ -49,7 +49,7 @@ pub const SPECS: &[Spec] = &[
       r#"SELECT "graphicID","url3D","urlWeb","description","published","obsolete","icon","urlSound","explosionID" FROM "eveGraphics""#),
     empty("config.BulkData.owners", Shape::Tuple, &["ownerID", "ownerName", "typeID"]),
     s("config.BulkData.tickernames", Shape::Tuple,
-      r#"SELECT "corporationID","tickerName" FROM "corporation""#),
+      r#"SELECT "corporationID","tickerName","shape1","shape2","shape3","color1","color2","color3" FROM "corporation""#),
     empty("config.BulkData.allianceshortnames", Shape::Tuple, &["allianceID", "shortName"]),
     empty("config.BulkData.locations", Shape::Tuple,
           &["locationID", "locationName", "x", "y", "z"]),

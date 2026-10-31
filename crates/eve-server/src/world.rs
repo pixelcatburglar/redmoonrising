@@ -101,6 +101,35 @@ pub struct WorldState {
     pub bot_counts: HashMap<i64, (i64, i64)>,
     /// How the bot population stands, for the web dashboard.
     pub bot_stats: BotStats,
+    /// Every bot as Local shows it, by its index in the bot population.
+    pub bot_roster: Arc<Vec<LocalBot>>,
+    /// The online bots in each solar system, docked or not, as indexes into
+    /// `bot_roster`: who is in Local there.
+    pub bot_local: HashMap<i64, Vec<u32>>,
+}
+
+/// A siege as the dashboard shows it.
+#[derive(Debug, Clone)]
+pub struct SiegeView {
+    pub attacker: String,
+    pub defender: String,
+    pub system: String,
+    pub region: String,
+    pub security: f64,
+    /// When it begins (began), FILETIME.
+    pub starts: i64,
+    /// Ships still fighting on each side, once it is being fought.
+    pub fleets: Option<(usize, usize)>,
+}
+
+/// A bot as a Local channel lists it.
+#[derive(Debug, Clone)]
+pub struct LocalBot {
+    pub char_id: i64,
+    pub corp_id: i64,
+    pub alliance_id: Option<i64>,
+    pub name: String,
+    pub type_id: i64,
 }
 
 /// The bot population at its last save.
@@ -118,6 +147,8 @@ pub struct BotStats {
     pub war_losses: HashMap<i64, u32>,
     /// What happened in null-sec lately, oldest first: (FILETIME, what).
     pub news: Vec<(i64, String)>,
+    /// Sieges announced or being fought.
+    pub sieges: Vec<SiegeView>,
     pub running: bool,
 }
 
@@ -325,12 +356,36 @@ impl WorldState {
         rest
     }
 
+    /// The Local channels open: (solar system, the channel as the clients
+    /// name it, who has it open).
+    pub fn local_channels(&self) -> Vec<(i64, Value, Vec<i64>)> {
+        self.channels
+            .values()
+            .filter_map(|c| Some((local_system(&c.id)?, c.id.clone(), c.members.iter().copied().collect())))
+            .collect()
+    }
+
+    /// The character in the game on a connection.
+    pub fn presence_of_client(&self, client_id: i64) -> Option<Presence> {
+        self.clients.get(&client_id).and_then(|c| c.presence)
+    }
+
     /// Everyone who has a chat channel open.
     pub fn channel_members(&self, channel_id: &Value) -> Vec<i64> {
         self.channels
             .get(&channel_key(channel_id))
             .map(|c| c.members.iter().copied().collect())
             .unwrap_or_default()
+    }
+}
+
+/// The solar system of a Local channel, `[('solarsystemid2', id)]`.
+pub fn local_system(channel_id: &Value) -> Option<i64> {
+    let pair = channel_id.seq()?.first()?.seq()?;
+    match pair {
+        [Value::Unicode(key), id] if key == "solarsystemid2" => id.as_i64(),
+        [key, id] if key.as_bytes() == Some(b"solarsystemid2".as_slice()) => id.as_i64(),
+        _ => None,
     }
 }
 
@@ -346,6 +401,23 @@ mod tests {
 
     fn presence(char_id: i64, docked: bool) -> Option<Presence> {
         Some(Presence { char_id, corp_id: 1000044, solar_system_id: 30002780, docked, station_id: None, role: 3 })
+    }
+
+    #[test]
+    fn local_channels_are_known_by_their_system() {
+        let local = Value::List(vec![Value::Tuple(vec![Value::bytes("solarsystemid2"), Value::Int(30002780)])]);
+        assert_eq!(local_system(&local), Some(30002780));
+        let unicode = Value::Tuple(vec![Value::Tuple(vec![Value::Unicode("solarsystemid2".into()), Value::Int(30000142)])]);
+        assert_eq!(local_system(&unicode), Some(30000142));
+        let corp = Value::List(vec![Value::Tuple(vec![Value::bytes("corpid"), Value::Int(1000044)])]);
+        assert_eq!(local_system(&corp), None);
+        assert_eq!(local_system(&Value::Int(1)), None);
+
+        let world = World::default();
+        let mut w = world.lock();
+        let _a = w.connect(1);
+        w.join_channel(&local, 1);
+        assert_eq!(w.local_channels().into_iter().map(|(s, _, m)| (s, m)).collect::<Vec<_>>(), vec![(30002780, vec![1])]);
     }
 
     #[test]

@@ -128,7 +128,7 @@ function uptime(seconds) {
 }
 async function refresh() {
     try {
-        const [summary, wars, players, systems, alliances, corporations, kills, news] = await Promise.all([
+        const [summary, wars, players, systems, alliances, corporations, kills, news, sieges] = await Promise.all([
             get("/api/summary"),
             get("/api/wars"),
             get("/api/players"),
@@ -137,6 +137,7 @@ async function refresh() {
             get("/api/corporations"),
             get("/api/kills"),
             get("/api/news"),
+            get("/api/sieges"),
         ]);
         showStatus(summary);
         list("wars", [
@@ -173,6 +174,18 @@ async function refresh() {
             { title: "Alliance", key: (c) => c.alliance ?? "", cell: (c) => [allianceTicker(c.alliance)] },
             { title: "Members", num: true, key: (c) => c.members, cell: (c) => count(c.members) },
         ], corporations, "No corporations have been founded.", 2, true);
+        list("sieges", [
+            { title: "System", key: (s) => s.system, cell: (s) => [security(s.security), ` ${s.system}`, span(` ${s.region}`, "dim")] },
+            { title: "Attacker", key: (s) => s.attacker, cell: (s) => [s.attacker] },
+            { title: "Defender", key: (s) => s.defender, cell: (s) => [s.defender] },
+            {
+                title: "When",
+                key: (s) => s.starts,
+                cell: (s) => s.fighting
+                    ? [span(`BATTLE ${s.attackers ?? 0} vs ${s.defenders ?? 0}`, "hostile")]
+                    : [eveTime(s.starts)],
+            },
+        ], sieges, "No sieges are planned.", 3, false);
         list("news", [
             { title: "Time", key: (n) => n.time, cell: (n) => [eveTime(n.time)] },
             { title: "Report", key: (n) => n.text, cell: (n) => [n.text] },

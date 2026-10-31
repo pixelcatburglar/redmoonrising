@@ -14,6 +14,8 @@
 
 pub mod behaviour;
 mod politics;
+mod battle;
+mod defense;
 mod population;
 mod presence;
 mod sov;
@@ -61,13 +63,13 @@ pub fn status() -> String {
     if s.is_empty() { "The bots are not running.".into() } else { s }
 }
 
-pub async fn run(server: Arc<Server>, target: usize, speed: f64) {
+pub async fn run(server: Arc<Server>, target: usize, speed: f64, shown: usize) {
     if target == 0 {
         return;
     }
     match start(&server, target).await {
         Ok((mut db, atlas, mut bots, mut ids)) => {
-            let presence = Presence::new(presence::hulls(&db, &ids).await);
+            let presence = Presence::new(presence::hulls(&db, &ids).await, shown);
             let mut rng = Rng::seeded(crate::bulkdata::filetime_now() as u64 ^ 0x5eed);
             let politics = match politics::load(&db, &atlas, 0, speed).await {
                 Ok(p) if !p.corps.is_empty() => Ok(p),
@@ -84,7 +86,8 @@ pub async fn run(server: Arc<Server>, target: usize, speed: f64) {
                         Ok(_) => {}
                         Err(e) => error!("bots: settling null-sec: {}", crate::logging::chain(&e)),
                     }
-                    simulate(server, db, atlas, bots, ids, presence, politics, speed).await
+                    let types = character_types(&db).await;
+                    simulate(server, db, atlas, bots, ids, types, presence, politics, speed).await
                 }
                 Err(e) => error!("bots: politics: {}", crate::logging::chain(&e)),
             }
@@ -122,11 +125,16 @@ async fn simulate(
     atlas: Atlas,
     mut bots: Vec<Bot>,
     mut ids: Vec<Identity>,
+    types: HashMap<i32, i64>,
     mut presence: Presence,
     mut politics: politics::Politics,
     speed: f64,
 ) {
     let (mut next_politics, mut next_skirmish) = (POLITICS_EVERY, SKIRMISH_EVERY);
+    // Sieges announced, and those being fought.
+    let mut sieges: Vec<sov::Siege> = Vec::new();
+    // Towers under attack, and the fleets defending them.
+    let mut defenses: Vec<defense::Defense> = Vec::new();
     let by_char: HashMap<i64, u32> = bots.iter().enumerate().map(|(i, b)| (b.id as i64, i as u32)).collect();
     let mut changes = Vec::new();
     let mut last_sync = Instant::now();
@@ -144,6 +152,7 @@ async fn simulate(
     let mut dirty = vec![true; bots.len()];
     let mut changed: Vec<u32> = (0..bots.len() as u32).collect();
     let mut tally = Tally::default();
+    server.world.lock().bot_roster = roster(&bots, &ids, &types);
     let (mut last_flush, mut last_report, mut last_tick) = (Instant::now(), Instant::now(), Instant::now());
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -195,7 +204,10 @@ async fn simulate(
                 if let Err(e) = politics::tick(&mut politics, &db, &bots, &mut ids, &mut rng, now, speed).await {
                     error!("bots: politics: {}", crate::logging::chain(&e));
                 }
-                match sov::upkeep(&db, &atlas, &mut politics, presence.watched(), &mut rng, server.sov_claim_delay_secs, speed).await {
+                // Some joined corporations: Local shows them in their new ones.
+                let fresh = roster(&bots, &ids, &types);
+                server.world.lock().bot_roster = fresh;
+                match sov::upkeep(&db, &atlas, &mut politics, presence.watched(), &mut sieges, &mut rng, now, server.sov_claim_delay_secs, speed).await {
                     Ok(news) => politics.tell(news),
                     Err(e) => error!("bots: sovereignty: {}", crate::logging::chain(&e)),
                 }
@@ -203,6 +215,30 @@ async fn simulate(
         }
         if last_sync.elapsed() >= SYNC {
             last_sync = Instant::now();
+            if running {
+                let now = clock as u32;
+                let mut report = defense::run(&mut defenses, &server.world, &db, &atlas, &mut bots, &ids, &mut presence, &politics, &mut rng, now).await;
+                if !sieges.is_empty() {
+                    let fought = battle::run(&mut sieges, &server.world, &db, &atlas, &mut bots, &ids, &mut presence, &mut politics, &mut rng, now, server.sov_claim_delay_secs, speed).await;
+                    match fought {
+                        Ok(r) => report.merge(r),
+                        Err(e) => error!("bots: sieges: {}", crate::logging::chain(&e)),
+                    }
+                }
+                politics.tell(report.news);
+                for i in report.touched {
+                    if !dirty[i as usize] {
+                        dirty[i as usize] = true;
+                        changed.push(i);
+                    }
+                }
+                // Sent home: they set off now.
+                for i in report.released {
+                    generation[i as usize] += 1;
+                    due.push(Reverse((now + 30, i, generation[i as usize])));
+                    changes.push(presence::Change::Busy { bot: i });
+                }
+            }
             let noted = if running { std::mem::take(&mut changes) } else { Vec::new() };
             for (i, wait) in presence.sync(&server.world, &atlas, &mut bots, &ids, &by_char, noted, &mut rng) {
                 generation[i as usize] += 1;
@@ -229,7 +265,7 @@ async fn simulate(
             tally.flushed_rows += rows as u64;
             tally.flush_time += took;
             tally.worst_flush = tally.worst_flush.max(took);
-            publish_counts(&server, &bots, &politics, running);
+            publish_counts(&server, &bots, &politics, &sieges, running);
         }
         if last_report.elapsed() >= REPORT {
             let mut summary = report(&bots, &tally, last_report.elapsed(), clock, speed, running);
@@ -275,7 +311,7 @@ async fn flush(db: &Client, bots: &[Bot], changed: &[u32]) -> Result<(), tokio_p
 
 /// The star map's counts take in the online bots: (in space, docked) by
 /// system; and the dashboard's figures follow.
-fn publish_counts(server: &Server, bots: &[Bot], politics: &politics::Politics, running: bool) {
+fn publish_counts(server: &Server, bots: &[Bot], politics: &politics::Politics, sieges: &[sov::Siege], running: bool) {
     let mut counts: HashMap<i64, (i64, i64)> = HashMap::new();
     if running {
         for b in bots.iter().filter(|b| b.online) {
@@ -294,11 +330,83 @@ fn publish_counts(server: &Server, bots: &[Bot], politics: &politics::Politics, 
         lost: politics.lost,
         war_losses: politics.wars.iter().map(|w| (w.id as i64, w.kills)).collect(),
         news: politics.news.iter().cloned().collect(),
+        sieges: sieges
+            .iter()
+            .map(|s| crate::world::SiegeView {
+                attacker: s.names.attacker.clone(),
+                defender: s.names.defender.clone(),
+                system: s.names.system.clone(),
+                region: s.names.region.clone(),
+                security: s.names.security,
+                starts: s.starts_at,
+                fleets: s.fight.as_ref().map(|f| {
+                    let (a, d) = f.standing(bots, s.system);
+                    (a, d)
+                }),
+            })
+            .collect(),
         running,
     };
+    let mut local: HashMap<i64, Vec<u32>> = HashMap::new();
+    if running {
+        for (i, b) in bots.iter().enumerate().filter(|(_, b)| b.online) {
+            local.entry(b.system as i64).or_default().push(i as u32);
+        }
+    }
     let mut w = server.world.lock();
     w.bot_counts = counts;
     w.bot_stats = stats;
+    let before = std::mem::replace(&mut w.bot_local, local);
+    // The first time, everyone is already there: nobody arrives.
+    if !before.is_empty() {
+        tell_local(&w, &before);
+    }
+}
+
+/// Tells everyone with a Local channel open which bots came and went there
+/// since `before`.
+fn tell_local(w: &crate::world::WorldState, before: &HashMap<i64, Vec<u32>>) {
+    use crate::svc::chat;
+    for (system, channel, members) in w.local_channels() {
+        let was: std::collections::HashSet<u32> = before.get(&system).map(|v| v.iter().copied().collect()).unwrap_or_default();
+        let now: std::collections::HashSet<u32> = w.bot_local.get(&system).map(|v| v.iter().copied().collect()).unwrap_or_default();
+        let count = members.len() + now.len();
+        let came = now.difference(&was).map(|i| (*i, "JoinChannel"));
+        let went = was.difference(&now).map(|i| (*i, "LeaveChannel"));
+        for (i, method) in came.chain(went) {
+            if let Some(b) = w.bot_roster.get(i as usize) {
+                chat::announce_counted(w, &members, count, &channel, method, &chat::bot_who(b), Vec::new());
+            }
+        }
+    }
+}
+
+/// Every bot as Local shows it: name, corporation, alliance, portrait type.
+fn roster(bots: &[Bot], ids: &[Identity], types: &HashMap<i32, i64>) -> std::sync::Arc<Vec<crate::world::LocalBot>> {
+    let list = bots
+        .iter()
+        .zip(ids)
+        .map(|(b, id)| crate::world::LocalBot {
+            char_id: b.id as i64,
+            corp_id: id.corp as i64,
+            alliance_id: id.alliance.map(i64::from),
+            name: id.name.clone(),
+            type_id: types.get(&b.id).copied().unwrap_or(1373),
+        })
+        .collect();
+    std::sync::Arc::new(list)
+}
+
+/// The character type (by bloodline) of every bot, for their portraits in Local.
+async fn character_types(db: &Client) -> HashMap<i32, i64> {
+    let sql = r#"SELECT c."characterID", c."typeID" FROM "bots" b JOIN "character_" c ON c."characterID" = b."characterID""#;
+    match db.query(sql, &[]).await {
+        Ok(rows) => rows.iter().map(|r| (r.get::<_, i32>(0), r.get::<_, i32>(1) as i64)).collect(),
+        Err(e) => {
+            error!("bots: reading their character types: {}", crate::logging::chain(&e));
+            HashMap::new()
+        }
+    }
 }
 
 fn report(bots: &[Bot], t: &Tally, over: Duration, clock: f64, speed: f64, running: bool) -> String {

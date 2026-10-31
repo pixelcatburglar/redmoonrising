@@ -53,6 +53,18 @@ interface AllianceRow {
   systems: number;
 }
 
+interface SiegeRow {
+  attacker: string;
+  defender: string;
+  system: string;
+  region: string;
+  security: number;
+  starts: number;
+  fighting: boolean;
+  attackers: number | null;
+  defenders: number | null;
+}
+
 interface NewsItem {
   time: number;
   text: string;
@@ -241,7 +253,7 @@ function uptime(seconds: number): string {
 
 async function refresh(): Promise<void> {
   try {
-    const [summary, wars, players, systems, alliances, corporations, kills, news] = await Promise.all([
+    const [summary, wars, players, systems, alliances, corporations, kills, news, sieges] = await Promise.all([
       get<Summary>("/api/summary"),
       get<War[]>("/api/wars"),
       get<Player[]>("/api/players"),
@@ -250,6 +262,7 @@ async function refresh(): Promise<void> {
       get<CorporationRow[]>("/api/corporations"),
       get<Kill[]>("/api/kills"),
       get<NewsItem[]>("/api/news"),
+      get<SiegeRow[]>("/api/sieges"),
     ]);
     showStatus(summary);
 
@@ -291,6 +304,20 @@ async function refresh(): Promise<void> {
       { title: "Alliance", key: (c) => c.alliance ?? "", cell: (c) => [allianceTicker(c.alliance)] },
       { title: "Members", num: true, key: (c) => c.members, cell: (c) => count(c.members) },
     ], corporations, "No corporations have been founded.", 2, true);
+
+    list<SiegeRow>("sieges", [
+      { title: "System", key: (s) => s.system, cell: (s) => [security(s.security), ` ${s.system}`, span(` ${s.region}`, "dim")] },
+      { title: "Attacker", key: (s) => s.attacker, cell: (s) => [s.attacker] },
+      { title: "Defender", key: (s) => s.defender, cell: (s) => [s.defender] },
+      {
+        title: "When",
+        key: (s) => s.starts,
+        cell: (s) =>
+          s.fighting
+            ? [span(`BATTLE ${s.attackers ?? 0} vs ${s.defenders ?? 0}`, "hostile")]
+            : [eveTime(s.starts)],
+      },
+    ], sieges, "No sieges are planned.", 3, false);
 
     list<NewsItem>("news", [
       { title: "Time", key: (n) => n.time, cell: (n) => [eveTime(n.time)] },

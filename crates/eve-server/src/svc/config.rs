@@ -144,7 +144,7 @@ async fn locations(ctx: &Ctx<'_>, ids: &[i32]) -> Value {
 }
 
 const CORP_TICKER_SQL: &str = r#"
-    SELECT "corporationID", "tickerName" FROM "corporation"
+    SELECT "corporationID", "tickerName", "shape1", "shape2", "shape3", "color1", "color2", "color3" FROM "corporation"
      WHERE "corporationID" = ANY($1)"#;
 
 const ALLIANCE_SHORTNAME_SQL: &str = r#"

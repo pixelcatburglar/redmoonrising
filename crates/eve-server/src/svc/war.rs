@@ -450,6 +450,15 @@ pub fn side(p: &Pilot) -> i64 {
     p.alliance_id.filter(|a| *a != 0).unwrap_or(p.corp_id)
 }
 
+/// Puts a war between two sides in force, a few days old, for tests.
+#[cfg(test)]
+pub fn in_force_for_test(a: i64, b: i64) {
+    let declared = crate::bulkdata::filetime_now() - 3 * DAY;
+    if let Ok(mut w) = IN_FORCE.write() {
+        w.push((a, b, declared, None));
+    }
+}
+
 /// Whether two sides (alliances, or corporations outside one) are at war in
 /// a hostile state.
 pub fn sides_at_war(x: i64, y: i64) -> bool {

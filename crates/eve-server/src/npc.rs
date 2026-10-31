@@ -11,7 +11,7 @@
 //! player in range (or whoever shoots them), lock, orbit at their preferred
 //! range and fire on the module cycles `fight` runs for everyone.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use eve_marshal::Value;
@@ -30,6 +30,8 @@ const RESPAWN_MS: (f64, f64) = (240_000.0, 480_000.0);
 const MIN_AGGRO_RANGE: f64 = 30_000.0;
 /// A rat gives up on a target this far from its belt.
 const LEASH: f64 = 120_000.0;
+/// How far off a bot sees an enemy of its war worth going for.
+const WAR_AGGRO_RANGE: f64 = 80_000.0;
 const THINK_MS: i64 = 1_000;
 const GROUP_BELT: i64 = 9;
 const GROUP_CONCORD: i32 = 301;
@@ -248,6 +250,11 @@ pub struct Brain {
     pub loot_count: (usize, usize),
     /// CONCORD: here for one criminal, gone when done.
     pub police: Option<Police>,
+    /// Fights only those who attack it (a bot minding its own business).
+    passive: bool,
+    /// What it goes back to when the fight is over, instead of its belt (a
+    /// bot's errand).
+    pub resume: Option<Command>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -267,8 +274,47 @@ impl Brain {
     }
 
     fn aggro_range(&self) -> f64 {
+        if self.passive {
+            return 0.0;
+        }
         (self.attack_range * 2.0).max(MIN_AGGRO_RANGE)
     }
+
+    /// In a fight.
+    pub fn engaged(&self) -> bool {
+        self.target.is_some()
+    }
+}
+
+/// How a bot fights: it shoots back at whoever shoots it, with `weapons`
+/// from `attack_range`, orbiting at `fly_range`; unless `passive`, it also
+/// goes for any player it comes across. After a fight it takes up `resume`.
+pub fn bot_brain(weapons: Vec<Active>, attack_range: f64, fly_range: f64, passive: bool, resume: Command, now: i64) -> Brain {
+    Brain {
+        belt: 0,
+        bounty: 0.0,
+        target: None,
+        attack_range,
+        fly_range,
+        cruise: 0.5,
+        next_think_ms: now + THINK_MS,
+        weapons,
+        shield_boost: None,
+        armor_repair: None,
+        chasing: false,
+        security_bonus: 0.0,
+        security_max_gain: 0.0,
+        loot_count: (0, 0),
+        police: None,
+        passive,
+        resume: Some(resume),
+    }
+}
+
+/// A turret for a ship without an entity's weapon attributes (a bot's
+/// hull): `damage` per shot of each type, every `duration` ms.
+pub fn bot_gun(t: &NpcType, ship_id: i64, damage: [f64; 4], gun: Gun, duration: f64) -> Active {
+    entity_module(t, slot::gun(ship_id), EFFECT_TARGET_ATTACK, GUID_TURRET, Action::Turret { damage, gun }, duration)
 }
 
 // ---- loading ------------------------------------------------------------------------
@@ -460,19 +506,59 @@ pub fn rock_slim(rock: &Rock) -> Value {
 // ---- thinking -------------------------------------------------------------------------
 
 /// Spawns rats where players have come, and lets every rat think.
+/// A pilot in the park, as those who might fight it see it.
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    id: i64,
+    pos: Vec3,
+    player: bool,
+    /// Its side in a war: its alliance, or its corporation outside one.
+    side: i64,
+}
+
 pub fn think(park: &mut Park, now: i64, out: &mut Out) {
-    let players: Vec<(i64, Vec3)> =
-        park.ships.values().filter(|s| s.is_player() && !s.warping()).map(|s| (s.id, s.pos)).collect();
+    let seen: Vec<Seen> = park
+        .ships
+        .values()
+        .filter(|s| s.is_pilot() && !s.warping())
+        .map(|s| Seen { id: s.id, pos: s.pos, player: s.is_player(), side: crate::svc::war::side(&s.pilot) })
+        .collect();
+    let players: Vec<(i64, Vec3)> = seen.iter().filter(|s| s.player).map(|s| (s.id, s.pos)).collect();
     spawn_where_needed(park, now, &players, out);
     let due: Vec<i64> = park
         .ships
         .values()
-        .filter(|s| s.npc.as_ref().is_some_and(|b| b.police.is_none() && b.next_think_ms <= now))
+        .filter(|s| !s.warping() && s.npc.as_ref().is_some_and(|b| b.police.is_none() && b.next_think_ms <= now))
         .map(|s| s.id)
         .collect();
-    for id in due {
-        think_one(park, id, now, &players, out);
+    if due.is_empty() {
+        return;
     }
+    let enemies = enemies(park, &seen);
+    for id in due {
+        think_one(park, id, now, &seen, &enemies, out);
+    }
+}
+
+/// The pairs of sides here at war with each other, both ways round: whom
+/// armed bots fight on sight.
+fn enemies(park: &Park, seen: &[Seen]) -> HashSet<(i64, i64)> {
+    let mut found = HashSet::new();
+    if !park.ships.values().any(|s| s.bot && s.npc.is_some()) {
+        return found;
+    }
+    let mut sides: Vec<i64> = seen.iter().map(|s| s.side).collect();
+    sides.sort_unstable();
+    sides.dedup();
+    for (i, a) in sides.iter().enumerate() {
+        for b in &sides[i + 1..] {
+            if crate::svc::war::sides_at_war(*a, *b) {
+                found.insert((*a, *b));
+                found.insert((*b, *a));
+            }
+        }
+    }
+    found
 }
 
 fn spawn_where_needed(park: &mut Park, now: i64, players: &[(i64, Vec3)], out: &mut Out) {
@@ -609,6 +695,8 @@ fn make_rat(t: &NpcType, wildlife: &Wildlife, belt: i64, pos: Vec3, now: i64, rn
         security_max_gain: a(attr::ENTITY_SECURITY_MAX_GAIN),
         loot_count: (a(attr::ENTITY_LOOT_COUNT_MIN) as usize, a(attr::ENTITY_LOOT_COUNT_MAX) as usize),
         police: None,
+        passive: false,
+        resume: None,
     };
     let mut ship = Ship::new(id, 0, stats, pilot, pos, Vec3::ZERO);
     ship.fight = Some(fighter);
@@ -661,6 +749,8 @@ pub fn police_ship(t: &NpcType, criminal: i64, pos: Vec3, now: i64) -> Ship {
         security_max_gain: 0.0,
         loot_count: (0, 0),
         police: Some(Police { criminal, leave_ms: now + POLICE_LINGER_MS }),
+        passive: false,
+        resume: None,
     };
     let mut ship = Ship::new(id, 0, stats, pilot, pos, Vec3::ZERO);
     ship.fight = Some(fighter);
@@ -821,8 +911,10 @@ const MISSILE_FLIGHT_MULTIPLIER: i32 = 646;
 const MISSILE_CLOUD_MULTIPLIER: i32 = 858;
 const MISSILE_AOE_VELOCITY_MULTIPLIER: i32 = 859;
 
-fn think_one(park: &mut Park, id: i64, now: i64, players: &[(i64, Vec3)], out: &mut Out) {
+fn think_one(park: &mut Park, id: i64, now: i64, seen: &[Seen], enemies: &HashSet<(i64, i64)>, out: &mut Out) {
     let Some(rat) = park.ships.get_mut(&id) else { return };
+    // A bot also fights its war's enemies, wherever they come from.
+    let (is_bot, my_side) = (rat.bot, crate::svc::war::side(&rat.pilot));
     let (Some(brain), Some(fight)) = (rat.npc.as_mut(), rat.fight.as_mut()) else { return };
     brain.next_think_ms = now + THINK_MS;
 
@@ -851,10 +943,10 @@ fn think_one(park: &mut Park, id: i64, now: i64, players: &[(i64, Vec3)], out: &
 
     // Is the current target still worth it?
     if let Some(t) = brain.target {
-        let keep = players
+        let keep = seen
             .iter()
-            .find(|(p, _)| *p == t)
-            .is_some_and(|(_, tp)| (*tp - pos).len() <= leash && (*tp - belt_pos).len() <= LEASH * 1.5);
+            .find(|s| s.id == t && (s.player || is_bot))
+            .is_some_and(|s| (s.pos - pos).len() <= leash && (s.pos - belt_pos).len() <= LEASH * 1.5);
         if !keep {
             disengage(park, id, now, out);
             return;
@@ -867,10 +959,20 @@ fn think_one(park: &mut Park, id: i64, now: i64, players: &[(i64, Vec3)], out: &
         Some(t) => t,
         None => {
             let aggro = brain.aggro_range();
-            let nearest = players
+            let nearest = seen
                 .iter()
-                .map(|(p, tp)| (*p, (*tp - pos).len()))
-                .filter(|(_, d)| *d <= aggro)
+                .filter(|s| s.id != id)
+                .filter_map(|s| {
+                    let reach = if is_bot && enemies.contains(&(my_side, s.side)) {
+                        WAR_AGGRO_RANGE.max(aggro)
+                    } else if s.player {
+                        aggro
+                    } else {
+                        return None;
+                    };
+                    let d = (s.pos - pos).len();
+                    (d <= reach).then_some((s.id, d))
+                })
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             let Some((t, _)) = nearest else { return };
             t
@@ -953,8 +1055,8 @@ fn disengage(park: &mut Park, id: i64, now: i64, out: &mut Out) {
     let dropped: Vec<(i64, Lock)> = std::mem::take(&mut fight.locks).into_iter().collect();
     brain.target = None;
     brain.chasing = false;
-    let home = Command::Orbit { target: brain.belt, range: brain.fly_range.max(5_000.0) };
-    let cruise = brain.cruise;
+    let home = brain.resume.clone().unwrap_or(Command::Orbit { target: brain.belt, range: brain.fly_range.max(5_000.0) });
+    let cruise = if matches!(home, Command::Warp { .. }) { 1.0 } else { brain.cruise };
     for (t, lock) in dropped {
         if lock == Lock::Locked {
             crate::fight::tell_target_lost(park, id, t, out);
@@ -967,7 +1069,7 @@ fn disengage(park: &mut Park, id: i64, now: i64, out: &mut Out) {
             out.destiny(park.solar_system_id, e);
         }
     }
-    debug!("rat {id} returns to its belt");
+    debug!("NPC {id} disengages");
 }
 
 /// A rat died: its belt starts the clock on a new spawn once it is empty.

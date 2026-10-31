@@ -295,7 +295,7 @@ fn standing(corp: i64, alliance: Option<i64>, pilot: &Pilot) -> f64 {
 /// The pilot behind a ship (its own, or a drone's owner) as the defence
 /// judges it; None for what it leaves alone.
 fn judged(ship: &Ship) -> Option<(i64, &Pilot)> {
-    if ship.npc.is_some() || ship.in_warp() {
+    if ship.is_npc() || ship.in_warp() {
         return None;
     }
     match &ship.drone {

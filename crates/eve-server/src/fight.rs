@@ -26,6 +26,9 @@ const LOCK_SLACK: f64 = 1.1;
 /// Mining reaches a little past its range, for the same reason.
 const RANGE_SLACK: f64 = 1.1;
 const GROUP_CAPSULE: i64 = 29;
+/// What a bot's loot is worth, in ISK per 1,000 tonnes of hull: a frigate
+/// drops some ten thousand, a battleship up to a million.
+const BOT_LOOT_PER_TONNE: f64 = 15_000.0;
 /// A tower whose shield falls below this fraction goes reinforced.
 const REINFORCE_BELOW: f64 = 0.25;
 
@@ -281,11 +284,18 @@ fn project(park: &mut Park, ship_id: i64, m: &Active, now: i64, out: &mut Out) {
     }
 }
 
-/// Someone attacked `target`: a rat fights back; a pilot may have committed
-/// a crime.
+/// Someone attacked `target`: a rat or a bot fights back (at the pilot, if
+/// a drone did it); a pilot may have committed a crime.
 fn aggress(park: &mut Park, attacker: i64, target: i64, now: i64, out: &mut Out) {
+    let culprit = park
+        .ships
+        .get(&attacker)
+        .and_then(|s| s.drone.as_ref())
+        .and_then(|d| d.controller)
+        .filter(|c| park.ships.contains_key(c))
+        .unwrap_or(attacker);
     if let Some(brain) = park.ships.get_mut(&target).and_then(|s| s.npc.as_mut()) {
-        brain.provoked(attacker);
+        brain.provoked(culprit);
     }
     crate::concord::aggress(park, attacker, target, now, out);
 }
@@ -593,6 +603,7 @@ fn hit_structure(park: &mut Park, by: Attacker, target: i64, damage: Damage, sho
         _ => 0.0,
     };
     s.last_attacker = Some((by.char_id, by.ship_id));
+    let tower = s.tower.unwrap_or(target);
     if dealt > 0.0 {
         out.hurt(target);
     }
@@ -605,6 +616,11 @@ fn hit_structure(park: &mut Park, by: Attacker, target: i64, damage: Damage, sho
     }
     tell_shot(&by, target, None, shot, dealt, weapon, out);
     crate::concord::aggress_structure(park, by.ship_id, target, now, out);
+    // The attacker, or the pilot whose drone it is.
+    let culprit = park.ships.get(&by.ship_id).and_then(|s| s.drone.as_ref()).and_then(|d| d.controller).unwrap_or(by.ship_id);
+    if park.tower_alarms.len() < 64 {
+        park.tower_alarms.push((tower, culprit));
+    }
 }
 
 fn heal(park: &mut Park, ship_id: i64, _now: i64, out: &mut Out, f: impl FnOnce(&mut combat::Vitals)) {
@@ -670,7 +686,24 @@ fn deaths(park: &mut Park, now: i64, out: &mut Out) {
         out.destiny(system, entry(park.tick, "RemoveBalls", vec![Value::List(vec![Value::Int(id)])]));
         let Some(ship) = detach(park, id, now, out) else { continue };
         let killer = ship.fight.as_ref().and_then(|f| f.last_attacker);
-        if ship.npc.is_some() {
+        if ship.bot {
+            // As a player: a ship leaves its pilot in a capsule, a capsule
+            // leaves the pilot waking at home. Crimes count as against anyone.
+            let capsule = ship.pilot.group_id == GROUP_CAPSULE;
+            info!("bot {}'s {} {id} destroyed by {}", ship.pilot.name, if capsule { "capsule" } else { "ship" }, culprit(park, killer));
+            crate::concord::killed(park, &ship, capsule, out);
+            let pod = if capsule { None } else { crate::bots::eject(park, &ship, now, out) };
+            park.bot_losses.push((ship.pilot.char_id, pod));
+            out.jobs.push(Job::BotLost(Box::new(crate::losses::Loss::of(&ship, system, capsule))));
+            // What survived of its fittings and cargo, for whoever killed it.
+            if let Some((char_id, _)) = killer.filter(|(c, _)| *c != 0 && !capsule) {
+                let worth = (ship.stats.mass / 1.0e6 * BOT_LOOT_PER_TONNE).clamp(10_000.0, 1_000_000.0);
+                let stash = crate::loot::roll(worth, (1, 3), &mut park.rng);
+                if !stash.is_empty() {
+                    out.jobs.push(Job::Loot { system, pos: ship.pos, owner_id: char_id, stash });
+                }
+            }
+        } else if ship.npc.is_some() {
             npc::killed(park, &ship, now, out);
             let bounty = ship.npc.as_ref().map_or(0.0, |b| b.bounty);
             info!("{} ({id}) destroyed by {}, bounty {bounty}", ship.pilot.name, culprit(park, killer));
@@ -691,15 +724,6 @@ fn deaths(park: &mut Park, now: i64, out: &mut Out) {
                     out.jobs.push(Job::Loot { system, pos: ship.pos, owner_id: char_id, stash });
                 }
             }
-        } else if ship.bot {
-            // As a player: a ship leaves its pilot in a capsule, a capsule
-            // leaves the pilot waking at home. Crimes count as against anyone.
-            let capsule = ship.pilot.group_id == GROUP_CAPSULE;
-            info!("bot {}'s {} {id} destroyed by {}", ship.pilot.name, if capsule { "capsule" } else { "ship" }, culprit(park, killer));
-            crate::concord::killed(park, &ship, capsule, out);
-            let pod = if capsule { None } else { crate::bots::eject(park, &ship, now, out) };
-            park.bot_losses.push((ship.pilot.char_id, pod));
-            out.jobs.push(Job::BotLost(Box::new(crate::losses::Loss::of(&ship, system, capsule))));
         } else if let Some(drone) = &ship.drone {
             info!("drone {id} of {} destroyed by {}", drone.owner, culprit(park, killer));
             out.jobs.push(Job::DroneLost { client_id: Some(drone.client_id), drone_id: id });

@@ -85,6 +85,7 @@ async fn answer(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
             let body = match api {
                 "/api/summary" => Some(summary(server).await),
                 "/api/news" => Some(news(server)),
+                "/api/sieges" => Some(sieges(server)),
                 "/api/wars" => Some(wars(server).await),
                 "/api/players" => Some(players(server).await),
                 "/api/alliances" => Some(alliances(server).await),
@@ -168,6 +169,24 @@ async fn summary(server: &Server) -> Answer {
         "systemsHeld": held,
         "uptimeSeconds": STARTED.get().map_or(0, |s| s.elapsed().as_secs()),
     }))
+}
+
+/// Sieges announced or under way, soonest first: where to go to see a battle.
+fn sieges(server: &Server) -> Answer {
+    let mut list = server.world.lock().bot_stats.sieges.clone();
+    list.sort_by_key(|s| s.starts);
+    Ok(Json::Array(
+        list.iter()
+            .map(|s| {
+                json!({
+                    "attacker": s.attacker, "defender": s.defender, "system": s.system, "region": s.region,
+                    "security": (s.security * 10.0).round() / 10.0, "starts": s.starts / 10_000 - UNIX_EPOCH_MS,
+                    "fighting": s.fleets.is_some(),
+                    "attackers": s.fleets.map(|f| f.0), "defenders": s.fleets.map(|f| f.1),
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// What the bot alliances did in null-sec lately, newest first.

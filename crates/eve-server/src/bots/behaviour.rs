@@ -56,6 +56,8 @@ pub enum Activity {
     Ratting,
     /// Sitting on a gate, waiting for someone to come through.
     Camping,
+    /// In a siege fleet, at its alliance's call: stays until released.
+    Sieging,
 }
 
 #[derive(Debug, Clone)]
@@ -193,7 +195,7 @@ pub fn step(bot: &mut Bot, now: u32, atlas: &Atlas, rng: &mut Rng) -> u32 {
         return span(rng, 30, 300);
     }
     // Time to stop: home and dock, then log off.
-    if now >= bot.session_end && bot.activity != Activity::Travelling {
+    if now >= bot.session_end && !matches!(bot.activity, Activity::Travelling | Activity::Sieging) {
         if bot.station != 0 {
             bot.online = false;
             return offline_time(bot, rng);
@@ -212,7 +214,28 @@ pub fn step(bot: &mut Bot, now: u32, atlas: &Atlas, rng: &mut Rng) -> u32 {
             go(bot, atlas, atlas.system_of(bot.home), bot.home, rng)
         }
         Activity::Camping => roam(bot, atlas, rng),
+        // The fleet decides when it is over (`release`).
+        Activity::Sieging => 60,
     }
+}
+
+/// Called up for a siege: online, undocked and in `system`, where it stays
+/// until `release`d.
+pub fn muster(bot: &mut Bot, system: i32, now: u32) {
+    if !bot.online {
+        bot.online = true;
+    }
+    bot.session_end = bot.session_end.max(now + 2 * 3_600);
+    bot.system = system;
+    bot.station = 0;
+    bot.route.clear();
+    bot.dock_at = 0;
+    bot.activity = Activity::Sieging;
+}
+
+/// The siege over: home, to dock; returns the seconds until it sets off.
+pub fn release(bot: &mut Bot, atlas: &Atlas, rng: &mut Rng) -> u32 {
+    go(bot, atlas, atlas.system_of(bot.home), bot.home, rng)
 }
 
 /// Docked: what the role does next.

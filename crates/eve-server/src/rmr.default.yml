@@ -45,6 +45,10 @@ bots:
   count: 0
   # How many times faster than real time they live (RMR_BOTS_SPEED).
   speed: 1
+  # The most bot ships shown in one system at once, where a player is
+  # (RMR_BOTS_SHOWN). More makes bigger battles, and more work for the
+  # server and the clients there.
+  shownPerSystem: 120
 
 # Accounts made, or brought into line with this file, at every start.
 # Accounts not listed here are left as they are; removing one from the

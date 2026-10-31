@@ -37,6 +37,8 @@ pub struct Config {
     pub bots: usize,
     /// `RMR_BOTS_SPEED`: how many times faster than real time the bots live.
     pub bots_speed: f64,
+    /// `RMR_BOTS_SHOWN`: the most bot ships shown in one system at once.
+    pub bots_shown: usize,
     /// `RMR_WEB`: where the web dashboard listens (empty: no dashboard).
     pub web: String,
     /// `RMR_STARTING_ISK`: what a new character starts with.
@@ -135,6 +137,7 @@ struct GameSection {
 struct BotsSection {
     count: usize,
     speed: f64,
+    shown_per_system: usize,
 }
 
 impl Default for ServerSection {
@@ -159,7 +162,7 @@ impl Default for GameSection {
 
 impl Default for BotsSection {
     fn default() -> Self {
-        BotsSection { count: 0, speed: 1.0 }
+        BotsSection { count: 0, speed: 1.0, shown_per_system: 120 }
     }
 }
 
@@ -181,6 +184,7 @@ impl Config {
             sov_claim_delay_secs: file.game.sov_claim_delay_seconds,
             bots: file.bots.count,
             bots_speed: file.bots.speed,
+            bots_shown: file.bots.shown_per_system,
             web: file.server.web,
             starting_isk: file.game.starting_isk,
             auto_create_accounts: file.server.auto_create_accounts,
@@ -215,6 +219,7 @@ impl Config {
         number("RMR_SOV_CLAIM_DELAY", &mut c.sov_claim_delay_secs)?;
         number("RMR_BOTS", &mut c.bots)?;
         number("RMR_BOTS_SPEED", &mut c.bots_speed)?;
+        number("RMR_BOTS_SHOWN", &mut c.bots_shown)?;
         number("RMR_STARTING_ISK", &mut c.starting_isk)?;
         number("RMR_AUTO_CREATE_ACCOUNTS", &mut c.auto_create_accounts)?;
         if !(0..10_000_000).contains(&c.node_id) {
@@ -329,6 +334,7 @@ mod tests {
             sov_claim_delay_secs: 0,
             bots: 0,
             bots_speed: 1.0,
+            bots_shown: 120,
             web: String::new(),
             starting_isk: 0.0,
             auto_create_accounts: false,

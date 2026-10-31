@@ -3,9 +3,9 @@ use tokio_postgres::Row as PgRow;
 use tracing::{error, warn};
 
 use crate::services::{Call, Ctx, Outcome};
-use crate::session::Session;
+use crate::session::{Session, ROLE_LOGIN, ROLE_PLAYER};
 use crate::svc::rows::{int, row, rowset, text};
-use crate::world::WorldState;
+use crate::world::{local_system, LocalBot, WorldState};
 
 const OWNER_SYSTEM: i32 = 1;
 
@@ -421,7 +421,7 @@ pub fn announce(
     announce_counted(world, members, members.len(), channel, method, who, args);
 }
 
-fn announce_counted(
+pub fn announce_counted(
     world: &WorldState,
     targets: &[i64],
     member_count: usize,
@@ -455,13 +455,8 @@ async fn join_one(ctx: &Ctx<'_>, channel_id: &Value, me: Option<&Vec<Value>>) ->
     }
 
     if channel_id.seq().is_some() {
-        let lines = me.map(|m| vec![Value::List(m.clone())]).unwrap_or_default();
-        return joined(
-            id_value,
-            Value::None,
-            rowset(ACL_HEADER, Vec::new()),
-            rowset(MEMBER_HEADER, lines),
-        );
+        let members = local_members(ctx, channel_id, me).await;
+        return joined(id_value, Value::None, rowset(ACL_HEADER, Vec::new()), members);
     }
 
     refused(id_value, "Malformed channel identifier.")
@@ -591,6 +586,7 @@ async fn get_members(ctx: &Ctx<'_>, arg: Option<&Value>) -> Value {
     let me = self_member(ctx).await;
     match arg.and_then(|v| v.as_i64()) {
         Some(id) => members_for(ctx, id, me.as_ref()).await,
+        None if arg.is_some_and(|v| v.seq().is_some()) => local_members(ctx, arg.expect("checked"), me.as_ref()).await,
         None => {
             let lines = me.map(|m| vec![Value::List(m)]).unwrap_or_default();
             rowset(MEMBER_HEADER, lines)
@@ -635,6 +631,70 @@ async fn members_for(ctx: &Ctx<'_>, channel_id: i64, me: Option<&Vec<Value>>) ->
         }
     }
     rowset(MEMBER_HEADER, lines)
+}
+
+/// Who is in a Local channel (or another channel named by its session
+/// attributes): the players with it open, the caller, and in Local the bots
+/// online in that system.
+async fn local_members(ctx: &Ctx<'_>, channel_id: &Value, me: Option<&Vec<Value>>) -> Value {
+    let my_id = ctx.session.char_id.unwrap_or(0);
+    let (players, bots): (Vec<(i64, i64)>, Vec<LocalBot>) = {
+        let world = ctx.world.lock();
+        let players = world
+            .channel_members(channel_id)
+            .iter()
+            .filter_map(|c| world.presence_of_client(*c))
+            .map(|p| (p.char_id, p.role))
+            .filter(|(c, _)| *c != my_id)
+            .collect();
+        let bots = local_system(channel_id)
+            .and_then(|s| world.bot_local.get(&s))
+            .map(|list| list.iter().filter_map(|i| world.bot_roster.get(*i as usize).cloned()).collect())
+            .unwrap_or_default();
+        (players, bots)
+    };
+    let mut lines: Vec<Value> = me.map(|m| vec![Value::List(m.clone())]).unwrap_or_default();
+    if !players.is_empty() {
+        let ids: Vec<i32> = players.iter().map(|(c, _)| *c as i32).collect();
+        let sql = r#"SELECT c."characterID", c."corporationID", co."allianceID", c."characterName", c."typeID"
+                       FROM "character_" c LEFT JOIN "corporation" co ON co."corporationID" = c."corporationID"
+                      WHERE c."characterID" = ANY($1)"#;
+        match ctx.db.query(sql, &[&ids]).await {
+            Ok(rows) => {
+                for r in &rows {
+                    let id = int(r, 0).unwrap_or(0);
+                    let role = players.iter().find(|(c, _)| *c == id).map_or(ROLE_LOGIN | ROLE_PLAYER, |(_, role)| *role);
+                    lines.push(member_line(id, int(r, 1), nonzero(int(r, 2)), role, text(r, 3).unwrap_or_default(), int(r, 4).unwrap_or(0)));
+                }
+            }
+            Err(e) => error!("Local members: {err}", err = crate::logging::chain(&e)),
+        }
+    }
+    for b in bots.into_iter().filter(|b| b.char_id != my_id) {
+        lines.push(member_line(b.char_id, Some(b.corp_id), b.alliance_id, ROLE_LOGIN | ROLE_PLAYER, b.name, b.type_id));
+    }
+    rowset(MEMBER_HEADER, lines)
+}
+
+fn member_line(char_id: i64, corp_id: Option<i64>, alliance_id: Option<i64>, role: i64, name: String, type_id: i64) -> Value {
+    Value::List(vec![
+        Value::Int(char_id),
+        Value::int_or_none(corp_id),
+        Value::int_or_none(alliance_id),
+        Value::Long(role),
+        owner_hint(char_id, name, type_id),
+    ])
+}
+
+/// A bot as OnLSC names a speaker, for its comings and goings in Local.
+pub fn bot_who(b: &LocalBot) -> Value {
+    Value::Tuple(vec![
+        Value::int_or_none(b.alliance_id),
+        Value::Int(b.corp_id),
+        Value::List(vec![Value::Int(b.char_id), Value::text(b.name.clone()), Value::Int(b.type_id)]),
+        Value::Long(ROLE_LOGIN | ROLE_PLAYER),
+        Value::Long(0),
+    ])
 }
 
 async fn self_member(ctx: &Ctx<'_>) -> Option<Vec<Value>> {

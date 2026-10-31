@@ -203,7 +203,7 @@ pub fn slim(fields: Vec<(&str, Value)>) -> Value {
 fn ship_slim(ship: &Ship) -> Value {
     let p = &ship.pilot;
     // An NPC belongs to its corporation and has no pilot to show.
-    if ship.npc.is_some() {
+    if ship.is_npc() {
         return slim(vec![
             ("itemID", Value::Int(ship.id)),
             ("typeID", Value::Int(p.type_id)),

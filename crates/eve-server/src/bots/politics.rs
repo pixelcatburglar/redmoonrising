@@ -150,7 +150,35 @@ pub async fn load(db: &Client, atlas: &Atlas, clock: u32, speed: f64) -> Result<
         let left = ((int(&r, 3).unwrap_or(now) - now) as f64 / SECOND_FT as f64 * speed).max(0.0) as u32;
         p.wars.push(War { id: int(&r, 0).unwrap_or(0) as i32, a: int(&r, 1).unwrap_or(0) as i32, b: int(&r, 2).unwrap_or(0) as i32, ends: clock + left, kills: 0 });
     }
+    // Wars made before bot wars were dated back (see `start_wars`).
+    let sql = r#"UPDATE "crpWars" w SET "timeDeclared" = $1
+                  WHERE w."timeDeclared" > $1 AND w."retracted" IS NULL AND w."mutual" = 1
+                    AND EXISTS (SELECT 1 FROM "botGroups" g WHERE g."ownerID" = w."declaredByID")"#;
+    if db.execute(sql, &[&(now - crate::svc::war::DAY)]).await? > 0 {
+        crate::svc::war::refresh(db).await;
+    }
+    paint_logos(db).await?;
     Ok(p)
+}
+
+/// Gives bot corporations without one a logo: two or three shapes from the
+/// corporation paint shop's (graphics 415 on, 163 of them) in its colours
+/// (671 on, 15), picked from the corporation's ID so they stay the same.
+async fn paint_logos(db: &Client) -> Result<(), tokio_postgres::Error> {
+    let sql = r#"UPDATE "corporation" co SET
+                     "shape1" = 415 + (co."corporationID" % 163),
+                     "shape2" = 415 + ((co."corporationID" / 163) % 163),
+                     "shape3" = CASE WHEN co."corporationID" % 3 = 0 THEN NULL ELSE 415 + ((co."corporationID" / 26569) % 163) END,
+                     "color1" = 671 + (co."corporationID" % 15),
+                     "color2" = 671 + ((co."corporationID" / 15) % 15),
+                     "color3" = 671 + ((co."corporationID" / 225) % 15)
+                  FROM "botGroups" g
+                 WHERE g."ownerID" = co."corporationID" AND co."shape1" IS NULL"#;
+    let painted = db.execute(sql, &[]).await?;
+    if painted > 0 {
+        info!("bots: {painted} corporation logos drawn");
+    }
+    Ok(())
 }
 
 // ---- forming ---------------------------------------------------------------------------------
@@ -535,6 +563,7 @@ pub async fn form(db: &mut Client, atlas: &Atlas, bots: &mut [Bot], ids: &mut [I
     }
     start_wars(&mut p, db, rng, clock, speed).await?;
     info!("bots: politics formed in {:.1}s: {}", started.elapsed().as_secs_f64(), p.summary());
+    paint_logos(db).await?;
     Ok(p)
 }
 
@@ -643,11 +672,14 @@ async fn start_wars(p: &mut Politics, db: &Client, rng: &mut Rng, clock: u32, sp
         let length = days * DAY;
         let now = filetime_now();
         let finished = now + (length as f64 / speed.max(0.001)) as i64 * SECOND_FT;
+        // Dated a day back: bot wars are fought from the start, not after
+        // the day's notice a declared war gives.
+        let declared = now - crate::svc::war::DAY;
         let id: i32 = db
             .query_one(
                 r#"INSERT INTO "crpWars" ("warID","declaredByID","againstID","timeDeclared","timeFinished","mutual")
                    VALUES (nextval('dyn_id_seq'), $1, $2, $3, $4, 1) RETURNING "warID""#,
-                &[&a, &b, &now, &finished],
+                &[&a, &b, &declared, &finished],
             )
             .await?
             .get(0);
