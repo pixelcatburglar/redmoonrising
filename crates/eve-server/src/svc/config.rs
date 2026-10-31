@@ -111,17 +111,20 @@ async fn keyed(ctx: &Ctx<'_>, what: &str, sql: &str, ids: &[i32]) -> Value {
 async fn owners(ctx: &Ctx<'_>, ids: &[i32]) -> Value {
     const SQL: &str = r#"
         SELECT k.id AS "ownerID",
-               COALESCE(o."ownerName", c."characterName", co."corporationName") AS "ownerName",
+               COALESCE(o."ownerName", c."characterName", co."corporationName", a."allianceName") AS "ownerName",
                COALESCE(NULLIF(o."typeID", 0), NULLIF(c."typeID", 0), bt."typeID",
-                        CASE WHEN co."corporationID" IS NOT NULL THEN 2 END) AS "typeID"
+                        CASE WHEN co."corporationID" IS NOT NULL THEN 2 END,
+                        CASE WHEN a."allianceID" IS NOT NULL THEN 16159 END) AS "typeID"
           FROM unnest($1::int[]) AS k(id)
           LEFT JOIN "eveStaticOwners" o  ON o."ownerID"       = k.id
           LEFT JOIN "character_"     c   ON c."characterID"   = k.id
           LEFT JOIN "bloodlineTypes" bt  ON bt."bloodlineID"  = c."bloodlineID"
           LEFT JOIN "corporation"    co  ON co."corporationID" = k.id
-         WHERE COALESCE(o."ownerName", c."characterName", co."corporationName") IS NOT NULL
+          LEFT JOIN alliances        a   ON a."allianceID"     = k.id
+         WHERE COALESCE(o."ownerName", c."characterName", co."corporationName", a."allianceName") IS NOT NULL
            AND COALESCE(NULLIF(o."typeID", 0), NULLIF(c."typeID", 0), bt."typeID",
-                        CASE WHEN co."corporationID" IS NOT NULL THEN 2 END) IS NOT NULL"#;
+                        CASE WHEN co."corporationID" IS NOT NULL THEN 2 END,
+                        CASE WHEN a."allianceID" IS NOT NULL THEN 16159 END) IS NOT NULL"#;
     keyed(ctx, "GetMultiOwnersEx", SQL, ids).await
 }
 

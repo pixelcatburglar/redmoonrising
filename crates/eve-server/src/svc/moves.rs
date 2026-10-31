@@ -109,6 +109,7 @@ async fn run(ctx: &Ctx<'_>, container: Container, op: Op) -> Outcome {
                 crate::concord::took_from(ctx.db, ctx.world, system, me(ctx), corp_id, &origins).await;
                 crate::loot::clear_emptied(ctx.db, ctx.world, system, &origins).await;
             }
+            crate::svc::pvptrade::offers_changed(ctx.world, &origins);
             if let Some(before) = fitting_before {
                 fitting::push_attribute_changes(ctx, &before).await;
             }
@@ -311,6 +312,19 @@ async fn reachable(ctx: &Ctx<'_>, txn: &mut ItemTxn<'_>, item: &Item) -> DbResul
     if in_reachable_can(ctx, item) {
         return Ok(true);
     }
+    // One's own offer in a trade, taken back out.
+    if crate::svc::pvptrade::my_offer(ctx, item.owner_id, item.location_id) {
+        return Ok(true);
+    }
+    // A structure within reach (to put into), and what it holds (to take),
+    // as its usage settings allow.
+    use crate::svc::starbase::{may, Access};
+    if let Some(ok) = may(ctx, item.id, Access::ViewPut).await {
+        return Ok(ok);
+    }
+    if let Some(ok) = may(ctx, item.location_id, Access::Take).await {
+        return Ok(ok);
+    }
     if item.owner_id != me(ctx) {
         return Ok(false);
     }
@@ -358,6 +372,9 @@ async fn add(
     }
     if item.flag == 7 || item.id == me(ctx) {
         return refuse("That cannot be moved.");
+    }
+    if crate::svc::votes::locked(txn.tx(), item.id).await {
+        return refuse("That item is locked down by a corporation vote.");
     }
     if Some(item.id) == ctx.session.ship_id && dest.capacity.is_some() {
         return refuse("You cannot put your active ship in a container.");

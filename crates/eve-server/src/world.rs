@@ -32,6 +32,9 @@ pub enum Move {
     /// The capsule was destroyed; the pilot wakes in a clone at a station, in a
     /// new capsule if one could be made.
     Podded { station_id: i64, solar_system_id: i64, constellation_id: i64, region_id: i64, ship_id: Option<i64> },
+    /// The character's corporation, its alliance or its roles changed; the
+    /// connection reads them again.
+    Affiliation,
 }
 
 /// What a connection's queue carries, in the order it was queued.
@@ -48,6 +51,8 @@ pub struct Presence {
     pub corp_id: i64,
     pub solar_system_id: i64,
     pub docked: bool,
+    /// The station, when docked.
+    pub station_id: Option<i64>,
 }
 
 struct Client {
@@ -66,6 +71,8 @@ pub struct WorldState {
     clients: HashMap<i64, Client>,
     /// Open chat channels, by `channel_key`.
     channels: HashMap<String, Channel>,
+    /// Player trades under way, by trade container.
+    pub trades: HashMap<i64, crate::svc::pvptrade::Trade>,
     /// Solar system -> its ballpark. Created when the first ship arrives.
     pub parks: HashMap<i64, Park>,
 }
@@ -119,8 +126,18 @@ impl WorldState {
             .collect()
     }
 
+    /// The station `char_id` is docked in, if online and docked.
+    pub fn station_of(&self, char_id: i64) -> Option<i64> {
+        self.clients.values().filter_map(|c| c.presence).find(|p| p.char_id == char_id).and_then(|p| p.station_id)
+    }
+
     pub fn is_online(&self, char_id: i64) -> bool {
         self.clients.values().any(|c| c.presence.is_some_and(|p| p.char_id == char_id))
+    }
+
+    /// Whether `char_id` is online and undocked.
+    pub fn is_in_space(&self, char_id: i64) -> bool {
+        self.clients.values().any(|c| c.presence.is_some_and(|p| p.char_id == char_id && !p.docked))
     }
 
     /// Characters per solar system: (in space, docked). Every occupied system has
@@ -175,6 +192,18 @@ impl WorldState {
         }
     }
 
+    /// Tells the connections of everyone in `corp_ids`, and of `char_ids`,
+    /// to read their corporation and alliance again.
+    pub fn reaffiliate(&self, corp_ids: &[i64], char_ids: &[i64]) {
+        let mut clients: Vec<i64> = corp_ids.iter().flat_map(|c| self.corp_members(*c)).collect();
+        clients.extend(char_ids.iter().flat_map(|c| self.clients_of(*c)));
+        clients.sort_unstable();
+        clients.dedup();
+        for client in clients {
+            self.push_move(client, Move::Affiliation);
+        }
+    }
+
     /// Opens a chat channel for a client; returns everyone who has it open now.
     pub fn join_channel(&mut self, channel_id: &Value, client_id: i64) -> Vec<i64> {
         let channel = self
@@ -217,7 +246,7 @@ mod tests {
     use super::*;
 
     fn presence(char_id: i64, docked: bool) -> Option<Presence> {
-        Some(Presence { char_id, corp_id: 1000044, solar_system_id: 30002780, docked })
+        Some(Presence { char_id, corp_id: 1000044, solar_system_id: 30002780, docked, station_id: None })
     }
 
     #[test]

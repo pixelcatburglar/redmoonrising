@@ -15,7 +15,8 @@
 //! crime: it costs no status and brings no police.
 //!
 //! Fair game: anyone who aggressed you or your corporation, anyone flagged a
-//! criminal, and outlaws (security status -5 or lower).
+//! criminal, outlaws (security status -5 or lower), and anyone whose
+//! corporation or alliance is at war with yours (svc/war.rs).
 
 use std::collections::BTreeMap;
 
@@ -50,7 +51,7 @@ impl Watch {
         self.criminals.get(&char_id).is_some_and(|(until, _)| *until > now)
     }
 
-    fn aggressed(&self, by: i64, on: i64, now: i64) -> bool {
+    pub fn aggressed(&self, by: i64, on: i64, now: i64) -> bool {
         self.aggression.get(&by).and_then(|v| v.get(&on)).is_some_and(|t| now - t < AGGRESSION_MS)
     }
 
@@ -91,7 +92,8 @@ pub fn aggress(park: &mut Park, attacker: i64, target: i64, now: i64, out: &mut 
     }
     let fair = park.watch.is_criminal(on_char, now)
         || park.watch.aggressed_either(on_char, (by_char, by.pilot.corp_id), now)
-        || victim.pilot.security <= OUTLAW;
+        || victim.pilot.security <= OUTLAW
+        || crate::svc::war::at_war(&by.pilot, &victim.pilot);
     let fresh = !park.watch.aggressed(by_char, on_char, now);
     park.watch.aggression.entry(by_char).or_default().insert(on_char, now);
     if fresh {
@@ -115,16 +117,52 @@ pub fn aggress(park: &mut Park, attacker: i64, target: i64, now: i64, out: &mut 
     }
 }
 
+/// `attacker` shot at starbase structure `id`. Shooting someone else's
+/// structure is aggression against its owner, and in high-security space a
+/// crime unless the two sides are at war.
+pub fn aggress_structure(park: &mut Park, attacker: i64, id: i64, now: i64, out: &mut Out) {
+    let (Some(by), Some(s)) = (park.ships.get(&attacker), park.structures.get(&id)) else { return };
+    let Some(by_char) = pilot_of(by) else { return };
+    let own = s.owner_id == by_char || s.corp_id == by.pilot.corp_id;
+    let war = crate::svc::war::sides_at_war(crate::svc::war::side(&by.pilot), s.alliance_id.unwrap_or(s.corp_id));
+    if own {
+        return;
+    }
+    let fresh = !park.watch.aggressed(by_char, s.corp_id, now);
+    park.watch.aggression.entry(by_char).or_default().insert(s.corp_id, now);
+    if fresh {
+        let args = Value::Tuple(vec![Value::Int(park.solar_system_id), park.watch.aggressors()]);
+        for ship in park.players() {
+            out.note(ship.client_id, "OnAggressionChange", args.clone());
+        }
+    }
+    if war || !fresh {
+        return;
+    }
+    let security = park.wildlife.security;
+    if security >= HIGH_SEC {
+        let response = (5.0 + (1.0 - security.clamp(0.5, 1.0)) * 40.0) as i64 * 1_000;
+        let already = park.watch.criminals.get(&by_char).and_then(|(_, at)| *at);
+        park.watch.criminals.insert(by_char, (now + AGGRESSION_MS, Some(already.unwrap_or(now + response))));
+        out.jobs.push(Job::Security { char_id: by_char, delta: -0.5 * security });
+        info!("{by_char} attacked structure {id} in {}; CONCORD in {}s", park.solar_system_id, response / 1_000);
+    } else if security > 0.0 {
+        out.jobs.push(Job::Security { char_id: by_char, delta: -0.1 });
+    }
+}
+
 /// A player's ship died: the killer pays in security status where that is a crime.
 pub fn killed(park: &mut Park, ship: &Ship, capsule: bool, out: &mut Out) {
     let now = combat::now_ms();
     let Some(fight) = &ship.fight else { return };
     let Some((killer, killer_ship)) = fight.last_attacker.filter(|(c, _)| *c > 0 && *c != ship.pilot.char_id) else { return };
-    let killer_corp = park.ships.get(&killer_ship).map_or(0, |s| s.pilot.corp_id);
+    let killer_pilot = park.ships.get(&killer_ship).map(|s| &s.pilot);
+    let killer_corp = killer_pilot.map_or(0, |p| p.corp_id);
     let victim = ship.pilot.char_id;
     let fair = park.watch.is_criminal(victim, now)
         || park.watch.aggressed_either(victim, (killer, killer_corp), now)
-        || ship.pilot.security <= OUTLAW;
+        || ship.pilot.security <= OUTLAW
+        || killer_pilot.is_some_and(|p| crate::svc::war::at_war(p, &ship.pilot));
     let security = park.wildlife.security;
     if fair || security <= 0.0 {
         return;

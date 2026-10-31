@@ -868,7 +868,10 @@ fn think_one(park: &mut Park, id: i64, now: i64, players: &[(i64, Vec3)], out: &
     let Some(rat) = park.ships.get_mut(&id) else { return };
     let (Some(brain), Some(fight)) = (rat.npc.as_mut(), rat.fight.as_mut()) else { return };
     brain.target = Some(target);
-    if !fight.locks.contains_key(&target) {
+    // Aggro reaches further than sensors: a lock started out of range, or
+    // while jammed, would be dropped by the next pulse and started over.
+    let can_lock = distance <= fight.lock_range() && !fight.afflictions.jammed;
+    if can_lock && !fight.locks.contains_key(&target) {
         fight.locks.clear();
         let lock_ms = (combat::lock_seconds(fight.scan_resolution, signature) * 1_000.0) as i64;
         fight.locks.insert(target, Lock::Pending(now + lock_ms));

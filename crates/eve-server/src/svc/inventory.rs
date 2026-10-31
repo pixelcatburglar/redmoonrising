@@ -84,6 +84,13 @@ async fn container_method(ctx: &Ctx<'_>, container: Container, call: &Call) -> O
     }
     let (method, args) = (call.method.as_str(), &call.args);
     let arg = |i: usize| args.get(i).and_then(|v| v.as_i64());
+    // A starbase structure shows its contents only to those its settings let look.
+    if let Container::Item(id) = container {
+        use crate::svc::starbase::{may, Access};
+        if method == "List" && may(ctx, id, Access::ViewPut).await == Some(false) {
+            return Outcome::custom("You are not allowed to look inside that structure from here.");
+        }
+    }
     let out = match method {
         "List" => list(ctx, container).await,
 

@@ -10,12 +10,14 @@ mod drones;
 mod dogma;
 mod exceptions;
 mod fight;
+mod guard;
 mod heartbeat;
 mod items;
 mod logging;
 mod losses;
 mod loot;
 mod npc;
+mod pos;
 mod services;
 mod session;
 mod svc;
@@ -86,7 +88,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         services,
         world: world::World::default(),
         dump_dir: config.dump_dir.clone(),
+        alliance_join_delay_secs: config.alliance_join_delay_secs,
+        sov_claim_delay_secs: config.sov_claim_delay_secs,
     });
+    pos::set_speedup(config.starbase_speedup);
     tokio::spawn(heartbeat::run(Arc::clone(&server)));
     let listener = TcpListener::bind(&config.bind).await?;
     info!("listening on {} as node {}", config.bind, config.node_id);

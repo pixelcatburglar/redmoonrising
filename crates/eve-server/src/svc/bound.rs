@@ -54,10 +54,21 @@ pub fn params_of(call: &Call) -> Vec<i64> {
 }
 
 pub fn object_ref(node_id: i64, service: &str, params: &[i64]) -> Value {
-    let inner = Value::Tuple(vec![
-        Value::Bytes(object_id(node_id, service, params).into_bytes()),
-        Value::Long(crate::bulkdata::filetime_now()),
-    ]);
+    object_ref_with(node_id, service, params, Vec::new())
+}
+
+/// A reference to a server-side object, carrying the public attributes the
+/// client reads off it without a call (`__publicattributes__`;
+/// ObjectCallGPCS pickles them as `(objectID, attributes, refID)`).
+pub fn object_ref_with(node_id: i64, service: &str, params: &[i64], attributes: Vec<(&str, Value)>) -> Value {
+    let id = Value::Bytes(object_id(node_id, service, params).into_bytes());
+    let ref_id = Value::Long(crate::bulkdata::filetime_now());
+    let inner = if attributes.is_empty() {
+        Value::Tuple(vec![id, ref_id])
+    } else {
+        let attributes = attributes.into_iter().map(|(k, v)| (Value::bytes(k), v)).collect();
+        Value::Tuple(vec![id, Value::Dict(attributes), ref_id])
+    };
     match eve_marshal::save(&inner, &StringTable::empty()) {
         Ok(blob) => Value::CallbackObject(Box::new(Value::Bytes(blob))),
         Err(e) => {

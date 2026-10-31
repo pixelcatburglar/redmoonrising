@@ -47,6 +47,11 @@ pub async fn bill_mgr(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
 }
 
 const BILL_TYPE_RENTAL: i64 = 2;
+const BILL_TYPE_WAR: i64 = 4;
+const BILL_TYPE_ALLIANCE_MAINTENANCE: i64 = 5;
+/// market_refTypes: War Fee, Alliance Maintainance Fee.
+const REF_WAR_FEE: i32 = 49;
+const REF_ALLIANCE_MAINTENANCE_FEE: i32 = 50;
 pub const REF_OFFICE_RENTAL_FEE: i32 = 13;
 const REF_CORPORATION_PAYMENT: i32 = 11;
 
@@ -65,7 +70,12 @@ async fn pay_bill(ctx: &Ctx<'_>, bill_id: i64, corp: bool) -> Outcome {
         ctx.session.char_id
     };
     let Some(debtor) = debtor else { return Outcome::Value(Value::None) };
+    settle_bill(ctx, bill_id, debtor, debtor).await
+}
 
+/// Pays `debtor`'s open bill `bill_id` to its creditor out of `payer`'s
+/// wallet (the debtor's own, or an alliance's executor corporation's).
+pub async fn settle_bill(ctx: &Ctx<'_>, bill_id: i64, debtor: i64, payer: i64) -> Outcome {
     // Claim the bill first so it cannot be paid twice; released below on failure.
     let claim = r#"UPDATE "billsReceivable" SET "paid" = 1
                     WHERE "billID" = $1 AND "debtorID" = $2 AND "paid" = 0
@@ -75,14 +85,15 @@ async fn pay_bill(ctx: &Ctx<'_>, bill_id: i64, corp: bool) -> Outcome {
     };
     let creditor = int(&bill, 0).unwrap_or(0);
     let amount = float(&bill, 1).unwrap_or(0.0);
-    let ref_type = if int(&bill, 2) == Some(BILL_TYPE_RENTAL) {
-        REF_OFFICE_RENTAL_FEE
-    } else {
-        REF_CORPORATION_PAYMENT
+    let ref_type = match int(&bill, 2) {
+        Some(BILL_TYPE_RENTAL) => REF_OFFICE_RENTAL_FEE,
+        Some(BILL_TYPE_WAR) => REF_WAR_FEE,
+        Some(BILL_TYPE_ALLIANCE_MAINTENANCE) => REF_ALLIANCE_MAINTENANCE_FEE,
+        _ => REF_CORPORATION_PAYMENT,
     };
     let bill_ref = bill_id.to_string();
     let payment = Payment {
-        payer: debtor,
+        payer,
         payee: Some(creditor),
         amount,
         ref_type,
@@ -91,7 +102,7 @@ async fn pay_bill(ctx: &Ctx<'_>, bill_id: i64, corp: bool) -> Outcome {
     };
     let outcome = match move_cash(ctx.db_url, payment).await {
         Ok(()) => {
-            info!("bill {bill_id}: {debtor} paid {amount} ISK to {creditor}");
+            info!("bill {bill_id}: {payer} paid {amount} ISK of {debtor}'s to {creditor}");
             return Outcome::Value(Value::None);
         }
         Err(Transfer::NotEnough { need, have }) => Outcome::not_enough_money(need, have),
@@ -289,12 +300,13 @@ async fn bill_types(ctx: &Ctx<'_>) -> Value {
 }
 
 #[derive(Clone, Copy)]
-enum Side {
+pub enum Side {
     Payable,
     Receivable,
 }
 
-async fn bills(ctx: &Ctx<'_>, owner: Option<i64>, side: Side) -> Value {
+/// The open bills `owner` owes (Payable) or is owed (Receivable).
+pub async fn bills(ctx: &Ctx<'_>, owner: Option<i64>, side: Side) -> Value {
     const HEADER: &[&str] = &[
         "billID", "billTypeID", "debtorID", "creditorID", "amount", "dueDateTime", "interest",
         "externalID", "paid", "externalID2",

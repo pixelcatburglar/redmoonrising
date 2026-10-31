@@ -147,16 +147,11 @@ async fn corp_registry(ctx: &Ctx<'_>, method: &str, args: &[Value]) -> Outcome {
         "GetSharesByShareholder" => shares_by_shareholder(ctx, arg0.unwrap_or(0) != 0).await,
         "GetInfoWindowDataForChar" => info_window_data_for_char(ctx, arg0.unwrap_or(0)).await,
         "GetTitles" => index_rowset(TITLE_HEADER, "titleID", Vec::new()),
-        // Items locked by a corporation vote: none, since there are no votes.
-        "GetLockedItemLocations" => Value::List(Vec::new()),
-        "MemberCanRunForCEO" => Value::Int(0),
+        // The stations holding items locked down by a corporation vote.
+        "GetLockedItemLocations" => crate::svc::votes::locked_locations(ctx).await,
         "GetMemberIDsWithMoreThanAvgShares" => Value::List(Vec::new()),
 
-        "GetMembers" => {
-            return Outcome::Unknown(
-                "corpRegistry::GetMembers needs a bound util.SparseRowsetProvider".into(),
-            )
-        }
+        "GetMembers" => members_rowset(ctx, corp).await,
 
         _ => return Outcome::Unknown(format!("corpRegistry::{method}")),
     };
@@ -207,44 +202,99 @@ const MEMBER_HEADER: &[&str] = &[
 ];
 
 async fn member(ctx: &Ctx<'_>, char_id: i64) -> Value {
-    let sql = r#"SELECT c."characterID", c."corporationID", c."title", c."corporationDateTime",
-                        COALESCE(r."rolesAtAll", 0), COALESCE(r."rolesAtHQ", 0),
-                        COALESCE(r."rolesAtBase", 0), COALESCE(r."rolesAtOther", 0)
-                   FROM "character_" c
-                   LEFT JOIN "chrCorporationRoles" r ON r."characterID" = c."characterID"
-                  WHERE c."characterID" = $1"#;
-    match ctx.db.query(sql, &[&(char_id as i32)]).await {
-        Ok(rows) if !rows.is_empty() => {
-            let r = &rows[0];
-            let mask = |i: usize| Value::Long(r.get::<_, Option<i64>>(i).unwrap_or(0));
-            row(
-                MEMBER_HEADER,
-                vec![
-                    cell(r, 0),
-                    cell(r, 1),
-                    cell(r, 2),
-                    cell(r, 3),
-                    mask(4),
-                    Value::Long(0),
-                    mask(5),
-                    Value::Long(0),
-                    mask(6),
-                    Value::Long(0),
-                    mask(7),
-                    Value::Long(0),
-                    Value::None,
-                    Value::Long(0),
-                    Value::Int(1),
-                    Value::Int(1),
-                ],
-            )
-        }
-        Ok(_) => Value::None,
-        Err(e) => {
-            error!("GetMember({char_id}): {err}", err = crate::logging::chain(&e));
-            Value::None
-        }
+    match member_lines(ctx, MemberScope::One(char_id)).await.pop() {
+        Some((_, line)) => row(MEMBER_HEADER, line),
+        None => Value::None,
     }
+}
+
+enum MemberScope {
+    One(i64),
+    Corporation(i64),
+}
+
+/// Member rows (character ID, line), in character ID order.
+async fn member_lines(ctx: &Ctx<'_>, scope: MemberScope) -> Vec<(i64, Vec<Value>)> {
+    let (filter, id) = match scope {
+        MemberScope::One(id) => (r#"c."characterID""#, id),
+        MemberScope::Corporation(id) => (r#"c."corporationID""#, id),
+    };
+    let sql = format!(
+        r#"SELECT c."characterID", c."corporationID", c."title", c."corporationDateTime",
+                  COALESCE(r."rolesAtAll", 0), COALESCE(r."grantableRoles", 0),
+                  COALESCE(r."rolesAtHQ", 0), COALESCE(r."grantableRolesAtHQ", 0),
+                  COALESCE(r."rolesAtBase", 0), COALESCE(r."grantableRolesAtBase", 0),
+                  COALESCE(r."rolesAtOther", 0), COALESCE(r."grantableRolesAtOther", 0),
+                  co."stationID"
+             FROM "character_" c
+             JOIN "corporation" co ON co."corporationID" = c."corporationID"
+             LEFT JOIN "chrCorporationRoles" r ON r."characterID" = c."characterID"
+            WHERE {filter} = $1
+            ORDER BY c."characterID""#
+    );
+    ctx.query(&sql, &[&(id as i32)])
+        .await
+        .iter()
+        .map(|r| {
+            let mask = |i: usize| Value::Long(r.get::<_, Option<i64>>(i).unwrap_or(0));
+            let mut line = vec![cell(r, 0), cell(r, 1), cell(r, 2), cell(r, 3)];
+            line.extend((4..12).map(mask));
+            // baseID, titleMask, divisionID, squadronID.
+            line.extend([cell(r, 12), Value::Long(0), Value::Int(1), Value::Int(1)]);
+            (int(r, 0).unwrap_or(0), line)
+        })
+        .collect()
+}
+
+/// Bound object name of a corporation's member list.
+const MEMBERS_PROVIDER: &str = "corpMembers";
+
+/// GetMembers: a util.SparseRowset over a server-side provider, which the
+/// client pages through with Fetch and FetchByKey (rowset.py).
+async fn members_rowset(ctx: &Ctx<'_>, corp_id: i64) -> Value {
+    let count = member_lines(ctx, MemberScope::Corporation(corp_id)).await.len() as i64;
+    let provider = bound::object_ref_with(
+        ctx.node_id,
+        MEMBERS_PROVIDER,
+        &[corp_id],
+        vec![("realRowCount", Value::Int(count)), ("header", crate::svc::rows::header_value(MEMBER_HEADER))],
+    );
+    Value::Instance {
+        class: Box::new(Value::bytes("util.SparseRowset")),
+        state: Box::new(Value::Tuple(vec![crate::svc::rows::header_value(MEMBER_HEADER), provider, Value::Int(count)])),
+    }
+}
+
+/// The member list provider: Fetch(start, count) gives [(pk, line)],
+/// FetchByKey(pks) gives [(pk, position, line)].
+pub async fn members_provider(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
+    let corp_id = bound::parse(&call.service).and_then(|b| b.params.first().copied()).unwrap_or(0);
+    if !matches!(call.method.as_str(), "Fetch" | "FetchByKey") {
+        return None;
+    }
+    if ctx.session.corp_id != Some(corp_id) {
+        return Some(Outcome::custom("That is not your corporation's member list."));
+    }
+    let lines = member_lines(ctx, MemberScope::Corporation(corp_id)).await;
+    let value = if call.method == "Fetch" {
+        let start = call.arg_i64(0).unwrap_or(0).max(0) as usize;
+        let size = call.arg_i64(1).unwrap_or(0).max(0) as usize;
+        lines
+            .into_iter()
+            .skip(start)
+            .take(size)
+            .map(|(pk, line)| Value::Tuple(vec![Value::Int(pk), Value::List(line)]))
+            .collect()
+    } else {
+        let wanted: Vec<i64> = call.args.first().and_then(|v| v.seq()).unwrap_or(&[]).iter().filter_map(|v| v.as_i64()).collect();
+        lines
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (pk, _))| wanted.contains(pk))
+            .map(|(i, (pk, line))| Value::Tuple(vec![Value::Int(pk), Value::Int(i as i64), Value::List(line)]))
+            .collect()
+    };
+    Some(Outcome::Value(Value::List(value)))
 }
 
 const ROLE_HEADER: &[&str] = &["roleID", "roleName", "shortDescription", "description"];

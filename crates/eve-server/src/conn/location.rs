@@ -29,12 +29,10 @@ impl Conn {
     pub(super) async fn select_character(&mut self, req: &MachoPacket, char_id: i64) -> Result {
         let before = self.session.clone();
 
-        let sql = r#"SELECT c."characterID", c."corporationID", c."stationID", c."solarSystemID",
-                            c."constellationID", c."regionID",
-                            co."allianceID", co."stationID" AS "hqID", c."shipID",
+        let sql = r#"SELECT c."characterID", c."stationID", c."solarSystemID",
+                            c."constellationID", c."regionID", c."shipID",
                             c."characterName", c."typeID"
                        FROM "character_" c
-                       LEFT JOIN "corporation" co ON co."corporationID" = c."corporationID"
                       WHERE c."characterID" = $1 AND c."accountID" = $2"#;
         let user_id = self.session.user_id.unwrap_or(0);
         let rows = match self.server.db.query(sql, &[&(char_id as i32), &(user_id as i32)]).await {
@@ -52,26 +50,23 @@ impl Conn {
         };
 
         let opt = |i: usize| crate::svc::rows::int(row, i);
-        let opt_id = |i: usize| opt(i).filter(|v| *v != 0);
         self.session.char_id = Some(char_id);
-        self.session.char_name = crate::svc::rows::text(row, 9).unwrap_or_default();
-        self.session.char_type_id = opt(10).unwrap_or(0);
-        self.session.corp_id = opt(1);
-        self.session.station_id = opt(2);
-        self.session.solar_system_id = opt(3);
-        self.session.constellation_id = opt(4);
-        self.session.region_id = opt(5);
-        self.session.alliance_id = opt_id(6);
-        self.session.hq_id = opt_id(7);
-        self.session.base_id = self.session.hq_id;
-        self.session.solar_system_id2 = opt(3);
+        self.session.char_name = crate::svc::rows::text(row, 6).unwrap_or_default();
+        self.session.char_type_id = opt(7).unwrap_or(0);
+        self.session.station_id = opt(1);
+        self.session.solar_system_id = opt(2);
+        self.session.constellation_id = opt(3);
+        self.session.region_id = opt(4);
+        self.session.solar_system_id2 = opt(2);
         if self.session.station_id.is_some() {
             self.session.solar_system_id = None;
         }
+        let ship = opt(5);
         self.session.ship_id = match self.session.station_id {
             Some(station) => self.resolve_active_ship(char_id, station).await,
-            None => opt(8),
+            None => ship,
         };
+        self.load_affiliation(char_id).await;
         self.span.record("char", char_id);
 
         self.send_session_change_from(&before).await?;
@@ -113,6 +108,9 @@ impl Conn {
         ship.pos = pos;
         ship.vel = heading * ship.stats.max_velocity;
 
+        if let Some(char_id) = self.session.char_id {
+            crate::svc::pvptrade::left_station(&self.server.db_url, &self.server.world, char_id).await;
+        }
         let before = self.session.clone();
         self.session.station_id = None;
         self.session.solar_system_id = Some(system_id);
@@ -369,8 +367,47 @@ impl Conn {
                 self.send_session_change_from(&before).await?;
                 info!(ship = ?ship_id, "capsule destroyed; woke up in a clone at station {station_id}");
             }
+            Move::Affiliation => {
+                let Some(char_id) = self.session.char_id else { return Ok(()) };
+                self.load_affiliation(char_id).await;
+                if self.session.change_from(&before) != Value::Dict(Vec::new()) {
+                    self.send_session_change_from(&before).await?;
+                    info!(corp = ?self.session.corp_id, alliance = ?self.session.alliance_id, "affiliation changed");
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Reads the character's corporation, its alliance and HQ, and the
+    /// character's roles in it into the session.
+    async fn load_affiliation(&mut self, char_id: i64) {
+        const SQL: &str = r#"
+            SELECT c."corporationID", co."allianceID", co."stationID",
+                   COALESCE(r."rolesAtAll", 0), COALESCE(r."rolesAtHQ", 0),
+                   COALESCE(r."rolesAtBase", 0), COALESCE(r."rolesAtOther", 0)
+              FROM "character_" c
+              LEFT JOIN "corporation" co ON co."corporationID" = c."corporationID"
+              LEFT JOIN "chrCorporationRoles" r ON r."characterID" = c."characterID"
+             WHERE c."characterID" = $1"#;
+        let row = match self.server.db.query_opt(SQL, &[&(char_id as i32)]).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(e) => {
+                error!("loading the corporation of {char_id}: {}", crate::logging::chain(&e));
+                return;
+            }
+        };
+        let opt = |i: usize| crate::svc::rows::int(&row, i);
+        let s = &mut self.session;
+        s.corp_id = opt(0);
+        s.alliance_id = opt(1).filter(|v| *v != 0);
+        s.hq_id = opt(2).filter(|v| *v != 0);
+        s.base_id = s.hq_id;
+        s.roles_at_all = opt(3).unwrap_or(0);
+        s.roles_at_hq = opt(4).unwrap_or(0);
+        s.roles_at_base = opt(5).unwrap_or(0);
+        s.roles_at_other = opt(6).unwrap_or(0);
     }
 
     /// Record a dock: the ship goes into the station hangar, the pilot into the

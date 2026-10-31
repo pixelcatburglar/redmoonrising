@@ -23,10 +23,13 @@ pub mod lookup;
 pub mod medical;
 pub mod map;
 pub mod market;
+pub mod membership;
+pub mod moonmining;
 pub mod missions;
 pub mod moves;
 pub mod notes;
 pub mod onlinestatus;
+pub mod pvptrade;
 pub mod petition;
 pub mod ram;
 pub mod repair;
@@ -34,10 +37,13 @@ pub mod reprocessing;
 pub mod rows;
 pub mod skills;
 pub mod space;
+pub mod starbase;
 pub mod standing;
 pub mod station;
 pub mod trade;
+pub mod votes;
 pub mod tutorial;
+pub mod war;
 pub mod wallet;
 
 use crate::services::{handler, Registry};
@@ -73,6 +79,7 @@ pub fn registry() -> Registry {
         // items and ships
         .add_bound("invbroker", handler!(inventory::invbroker))
         .add("invcontainer", handler!(inventory::invcontainer))
+        .add_bound("dogmaIM", handler!(starbase::dogma_im))
         .add_bound("dogmaIM", handler!(inflight::dogma_im))
         .add_bound("dogmaIM", handler!(dogma::dogma_im))
         .add("factory", handler!(factory::factory))
@@ -82,6 +89,7 @@ pub fn registry() -> Registry {
         .add_bound("ship", handler!(space::ship))
         .add_bound("insuranceSvc", handler!(insurance::insurance_svc))
         .add_bound("beyonce", handler!(space::beyonce))
+        .add_bound("posMgr", handler!(starbase::pos_mgr))
         .add_bound("entity", handler!(crate::drones::entity))
         .add_bound("aggressionMgr", handler!(crate::concord::aggression_mgr))
         // money and market
@@ -89,13 +97,20 @@ pub fn registry() -> Registry {
         .add("billMgr", handler!(wallet::bill_mgr))
         .add("marketProxy", handler!(market::market_proxy))
         .add("marketProxy", handler!(wallet::market_proxy))
+        .add("trademgr", handler!(pvptrade::trademgr))
+        .add_bound("tradeSession", handler!(pvptrade::session))
         // corporations and alliances
         .add("corpmgr", handler!(corp::corpmgr))
         .add("corporationSvc", handler!(corp::corporation_svc))
+        .add_bound("corpRegistry", handler!(membership::corp_registry))
+        .add_bound("corpRegistry", handler!(alliance::corp_registry))
+        .add_bound("corpRegistry", handler!(war::corp_registry))
+        .add_bound("corpRegistry", handler!(votes::corp_registry))
         .add_bound("corpRegistry", handler!(corp::registry))
         .add_bound("corpStationMgr", handler!(corp::station_mgr))
+        .add_bound("corpMembers", handler!(corp::members_provider))
         .add_bound("allianceRegistry", handler!(alliance::alliance_registry))
-        .add_bound("warRegistry", handler!(alliance::war_registry))
+        .add_bound("warRegistry", handler!(war::war_registry))
         // social
         .add("LSC", handler!(chat::lsc))
         .add("onlineStatus", handler!(onlinestatus::online_status))

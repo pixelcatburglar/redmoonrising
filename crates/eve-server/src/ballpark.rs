@@ -230,6 +230,8 @@ pub struct Ship {
     pub npc: Option<Brain>,
     /// A player's drone: whose, and what it was told to do.
     pub drone: Option<crate::drones::Drone>,
+    /// The shield harmonic its pilot set (SetShipPassword); -1 for none.
+    pub harmonic: i64,
 }
 
 impl Ship {
@@ -250,6 +252,7 @@ impl Ship {
             fight: None,
             npc: None,
             drone: None,
+            harmonic: crate::destiny::NO_HARMONIC,
         }
     }
 
@@ -288,6 +291,8 @@ pub struct Park {
     pub rocks: BTreeMap<i64, Rock>,
     /// Cargo containers floating here, by item ID.
     pub cans: BTreeMap<i64, crate::loot::Can>,
+    /// Starbase structures, by item ID.
+    pub structures: BTreeMap<i64, crate::pos::Structure>,
     /// Aggression and crime here.
     pub watch: crate::concord::Watch,
     pub belts: Vec<Belt>,
@@ -307,6 +312,7 @@ impl Park {
             ships: BTreeMap::new(),
             rocks: BTreeMap::new(),
             cans: BTreeMap::new(),
+            structures: BTreeMap::new(),
             watch: Default::default(),
             belts: Vec::new(),
             missiles: Vec::new(),
@@ -329,6 +335,9 @@ impl Park {
         }
         if let Some(c) = self.cans.get(&id) {
             return Some((c.pos, c.radius));
+        }
+        if let Some(s) = self.structures.get(&id) {
+            return Some((s.pos, s.radius));
         }
         self.celestial(id).map(|c| (c.pos, c.radius))
     }
@@ -426,6 +435,7 @@ impl Park {
             .map(|s| (s.id, (s.pos, s.stats.radius)))
             .chain(self.rocks.values().map(|r| (r.id, (r.pos, r.radius))))
             .chain(self.cans.values().map(|c| (c.id, (c.pos, c.radius))))
+            .chain(self.structures.values().map(|s| (s.id, (s.pos, s.radius))))
             .chain(self.celestials.iter().map(|c| (c.id, (c.pos, c.radius))))
             .collect();
         let mut thrust = BTreeMap::new();
@@ -502,6 +512,8 @@ impl Park {
                 inertia: s.stats.inertia(),
                 mass: s.stats.mass,
                 free: true,
+                key: (s.harmonic, s.pilot.corp_id, s.pilot.alliance_id.unwrap_or(-1)),
+                field: None,
             })
             .collect();
         let movers = bodies.len();
@@ -514,15 +526,23 @@ impl Park {
             inertia: IMMOVABLE,
             mass: IMMOVABLE,
             free: false,
+            key: (-1, -1, -1),
+            field: None,
         };
         bodies.extend(self.rocks.values().map(|r| fixed(r.id, r.pos, r.radius)));
         bodies.extend(self.celestials.iter().filter(|c| c.massive()).map(|c| fixed(c.id, c.pos, c.radius)));
+        bodies.extend(self.structures.values().filter(|s| s.fixed()).map(|s| fixed(s.id, s.pos, s.radius)));
+        for s in self.structures.values() {
+            if let Some(f) = &s.field {
+                bodies.push(Body { field: Some((f.harmonic, f.corp_id, f.alliance_id)), ..fixed(f.id, s.pos, f.radius) });
+            }
+        }
 
         let mut out = BTreeMap::new();
         for a in &bodies[..movers] {
             let prev_vel = self.ships[&a.id].prev_vel;
             let mut best: Option<(f64, Vec3)> = None;
-            for b in bodies.iter().filter(|b| b.id != a.id) {
+            for b in bodies.iter().filter(|b| b.id != a.id && !b.field.is_some_and(|f| passes(f, a.key))) {
                 let Some((toi, push)) = bounce(a, prev_vel, b) else { continue };
                 let push = push * BOUNCE;
                 // The latest contact of the tick wins; of two at the same
@@ -551,6 +571,17 @@ struct Body {
     inertia: f64,
     mass: f64,
     free: bool,
+    /// Its (harmonic, corporation, alliance), for force fields to test.
+    key: (i64, i64, i64),
+    /// A force field's (harmonic, corporation, alliance); -1 where unset.
+    field: Option<(i64, i64, i64)>,
+}
+
+/// Whether a ball keyed (harmonic, corporation, alliance) passes through a
+/// force field: the master harmonic, or a matching harmonic, corporation or
+/// alliance (destiny 2.10 0x10028d40).
+pub fn passes((harmonic, corp, alliance): (i64, i64, i64), (h, c, a): (i64, i64, i64)) -> bool {
+    h == -2 || (harmonic != -1 && harmonic == h) || (corp != -1 && corp == c) || (alliance != -1 && alliance == a)
 }
 
 /// Exact integration of v' = (tau * thrust - v) / tau over `dt` (0x1000dda0):

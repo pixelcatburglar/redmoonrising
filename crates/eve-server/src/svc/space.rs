@@ -37,13 +37,19 @@ pub async fn ship(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
             let ids = ids.iter().filter_map(|v| v.as_i64()).collect();
             Some(crate::svc::moves::assemble_ship(ctx, ids).await)
         }
-        // Drop(itemIDs, ownerID=None, ignoreWarning=False): launch drones, one per
-        // ID listed (a stack of five is listed five times).
+        // Drop(itemIDs, ownerID=None, ignoreWarning=False): launch structures or
+        // drones, one per ID listed (a stack of five is listed five times).
         "Drop" => {
             let ids = call.args.first().and_then(|v| v.seq()).unwrap_or(&[]);
             let ids: Vec<i64> = ids.iter().filter_map(|v| v.as_i64()).collect();
+            let owner = call.args.get(1).and_then(|v| v.as_i64());
+            if let Some(outcome) = crate::svc::starbase::launch(ctx, &ids, owner).await {
+                return Some(outcome);
+            }
             Some(crate::drones::launch(ctx, ids).await)
         }
+        // Scoop(itemID, password=None): a structure floating free.
+        "Scoop" => crate::svc::starbase::scoop(ctx, call.arg_id(0)).await,
         "ScoopDrone" => {
             let ids = call.args.first().and_then(|v| v.seq()).unwrap_or(&[]);
             let ids: Vec<i64> = ids.iter().filter_map(|v| v.as_i64()).collect();
@@ -96,6 +102,10 @@ pub async fn ensure_park(ctx: &Ctx<'_>, solar_system_id: i64) {
         warn!("cans in {solar_system_id} not loaded: {}", crate::logging::chain(&e));
         Vec::new()
     });
+    let structures = crate::pos::load(ctx.db, solar_system_id).await.unwrap_or_else(|e| {
+        warn!("structures in {solar_system_id} not loaded: {}", crate::logging::chain(&e));
+        Vec::new()
+    });
     let wildlife = match crate::npc::load(ctx.db, solar_system_id).await {
         Ok(w) => w,
         Err(e) => {
@@ -109,6 +119,7 @@ pub async fn ensure_park(ctx: &Ctx<'_>, solar_system_id: i64) {
         park.wildlife = std::sync::Arc::new(wildlife);
         crate::npc::populate(&mut park);
         park.cans = cans.into_iter().map(|c| (c.id, c)).collect();
+        park.structures = structures.into_iter().map(|s| (s.id, s)).collect();
         park
     });
 }
@@ -172,6 +183,7 @@ fn ship_ball(ship: &Ship) -> Ball {
         mass: ship.stats.mass,
         corp_id: ship.pilot.corp_id as i32,
         alliance_id: ship.pilot.alliance_id.unwrap_or(-1) as i32,
+        harmonic: ship.harmonic,
         max_velocity: ship.stats.max_velocity,
         velocity: ship.vel.tuple(),
         agility: ship.stats.agility,
@@ -304,6 +316,16 @@ pub fn set_state_entries(park: &Park, ego: i64, station_owners: &[(i64, i64)]) -
         slims.push(crate::loot::slim(can));
     }
     let mut damage = Vec::new();
+    let now_ms = crate::combat::now_ms();
+    for s in park.structures.values() {
+        balls.push(s.ball());
+        slims.push(s.slim());
+        damage.push((Value::Int(s.id), crate::fight::damage_state(&s.vitals, now_ms)));
+        if let Some(f) = &s.field {
+            balls.push(f.ball(s));
+            slims.push(f.slim(s));
+        }
+    }
     for ship in park.ships.values() {
         balls.push(ship_ball(ship));
         slims.push(ship_slim(ship));
@@ -541,41 +563,45 @@ async fn parse_order(ctx: &Ctx<'_>, call: &Call) -> Option<Order> {
             let kind = call.arg_text(0)?;
             let id = call.arg_i64(1)?;
             let range = call.kwarg("minRange").and_then(|v| v.as_f64()).unwrap_or(DEFAULT_WARP_RANGE);
-            let target = warp_target(ctx, &kind, id).await?;
-            Order::Command(Command::Warp { target, range })
+            let (at, radius) = warp_target(ctx, &kind, id).await?;
+            Order::Command(Command::Warp { target: landing_point(ctx, at, radius + range.max(0.0))?, range: 0.0 })
         }
         _ => return None,
     })
 }
 
-/// Where WarpToStuff(kind, id) goes: an item in the system, a bookmark, or
-/// another character's ship.
-async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<Vec3> {
+/// What WarpToStuff(kind, id) goes to, as its centre and radius: an item in
+/// the system, a bookmark, or another character's ship.
+async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<(Vec3, f64)> {
     let point = |r: &tokio_postgres::Row, i: usize| {
         Some(Vec3::new(float(r, i)?, float(r, i + 1)?, float(r, i + 2)?))
     };
     match kind {
         "item" => {
-            if let Some(point) = warp_in_point(ctx, id) {
-                return Some(point);
+            if let Some(ball) = ctx.world.lock().parks.get(&ctx.session.solar_system_id?).and_then(|p| p.ball(id)) {
+                return Some(ball);
             }
-            let sql = r#"SELECT "x","y","z" FROM "mapDenormalize" WHERE "itemID" = $1"#;
-            point(&ctx.query_one(sql, &[&(id as i32)]).await?, 0)
+            let sql = r#"SELECT "x","y","z", COALESCE("radius", 0) FROM "mapDenormalize" WHERE "itemID" = $1"#;
+            let r = ctx.query_one(sql, &[&(id as i32)]).await?;
+            Some((point(&r, 0)?, float(&r, 3).unwrap_or(0.0)))
         }
         "bookmark" => {
-            let sql = r#"SELECT b."x", b."y", b."z", d."x", d."y", d."z"
+            let sql = r#"SELECT b."x", b."y", b."z", d."x", d."y", d."z", COALESCE(d."radius", 0)
                            FROM bookmarks b
                            LEFT JOIN "mapDenormalize" d ON d."itemID" = b."itemID"
                           WHERE b."bookmarkID" = $1 AND b."ownerID" = $2"#;
             let owner = ctx.session.char_id? as i32;
             let r = ctx.query_one(sql, &[&(id as i32), &owner]).await?;
             // A bookmark of a celestial carries the celestial's position.
-            point(&r, 3).or_else(|| point(&r, 0))
+            match point(&r, 3) {
+                Some(at) => Some((at, float(&r, 6).unwrap_or(0.0))),
+                None => Some((point(&r, 0)?, 0.0)),
+            }
         }
         "char" => {
             let world = ctx.world.lock();
             let park = world.parks.get(&ctx.session.solar_system_id?)?;
-            park.ships.values().find(|s| s.pilot.char_id == id).map(|s| s.pos)
+            park.ships.values().find(|s| s.pilot.char_id == id).map(|s| (s.pos, s.stats.radius))
         }
         _ => {
             warn!("WarpToStuff to a {kind:?} is not supported");
@@ -584,19 +610,19 @@ async fn warp_target(ctx: &Ctx<'_>, kind: &str, id: i64) -> Option<Vec3> {
     }
 }
 
-/// Where a warp to something in the park aims. A ship or can: where it is
-/// now. A massive celestial: the point of its surface facing the ship, so
-/// that the warp's range is counted from the surface and nobody lands inside
-/// a planet (which destiny would throw them out of).
-fn warp_in_point(ctx: &Ctx<'_>, id: i64) -> Option<Vec3> {
+/// Where the warp lands: `reach` (the target's radius plus the warp range)
+/// out from `at` towards the ship, plus the ship's own radius, so the
+/// overview's surfaceDist reads the range asked for.
+///
+/// The server works the point out and sends WarpTo a range of 0. Left to
+/// destiny, the range is counted from wherever the ship finished aligning,
+/// which beside a planet can point under its surface; and a warp of under
+/// 100 km is a GotoPoint to the raw point, flying the ship into the planet.
+fn landing_point(ctx: &Ctx<'_>, at: Vec3, reach: f64) -> Option<Vec3> {
     let world = ctx.world.lock();
     let park = world.parks.get(&ctx.session.solar_system_id?)?;
-    if let Some(pos) = park.ships.get(&id).map(|s| s.pos).or_else(|| park.cans.get(&id).map(|c| c.pos)) {
-        return Some(pos);
-    }
-    let c = park.celestial(id).filter(|c| c.massive())?;
-    let from = park.ships.get(&ctx.session.ship_id?)?.pos;
-    Some(c.pos + (from - c.pos).unit() * c.radius)
+    let ship = park.ships.get(&ctx.session.ship_id?)?;
+    Some(at + (ship.pos - at).unit() * (reach + ship.stats.radius))
 }
 
 // ---- jumps --------------------------------------------------------------------------
@@ -640,8 +666,15 @@ pub fn arrival_point(gate: Vec3, gate_radius: f64) -> Vec3 {
     gate - gate.unit() * offset
 }
 
+const UNDOCK_ALONG_MIN_COS: f64 = 0.25;
+
 /// The undock point and push of a station: its type's dock entry, heading out
 /// along the dock orientation.
+///
+/// Some types' orientation runs along the hull or back into it (type 56 has
+/// its entry out along +Z and its orientation down -Y), which slides the
+/// undocking ship into the station; those leave straight out from the centre
+/// through the entry instead.
 pub async fn undock_point(ctx: &Ctx<'_>, station_id: i64) -> Option<(Vec3, Vec3)> {
     let sql = r#"SELECT d."x", d."y", d."z",
                         st."dockEntryX", st."dockEntryY", st."dockEntryZ",
@@ -652,12 +685,21 @@ pub async fn undock_point(ctx: &Ctx<'_>, station_id: i64) -> Option<(Vec3, Vec3)
                   WHERE s."stationID" = $1"#;
     let r = ctx.query_one(sql, &[&(station_id as i32)]).await?;
     let v = |i: usize| Vec3::new(float(&r, i).unwrap_or(0.0), float(&r, i + 1).unwrap_or(0.0), float(&r, i + 2).unwrap_or(0.0));
-    let station = v(0);
-    let mut heading = v(6).unit();
-    if heading == Vec3::ZERO {
-        heading = Vec3::new(1.0, 0.0, 0.0);
+    let (station, entry) = (v(0), v(3));
+    Some((station + entry, undock_heading(entry, v(6))))
+}
+
+/// See `undock_point`: the orientation if it leads away from the station,
+/// within ~75 degrees of straight out (the sound types are within 70).
+fn undock_heading(entry: Vec3, orientation: Vec3) -> Vec3 {
+    let (out, along) = (entry.unit(), orientation.unit());
+    if along != Vec3::ZERO && (out == Vec3::ZERO || out.dot(along) > UNDOCK_ALONG_MIN_COS) {
+        along
+    } else if out != Vec3::ZERO {
+        out
+    } else {
+        Vec3::new(1.0, 0.0, 0.0)
     }
-    Some((station + v(3), heading))
 }
 
 /// Is `id` a station in the park?
@@ -731,5 +773,17 @@ mod tests {
         let surface = (at - gate).len() - 2960.0;
         assert!((surface - ARRIVAL_CLEARANCE).abs() < 0.01, "surface distance {surface}");
         assert!(at.len() < gate.len(), "on the sun's side");
+    }
+
+    #[test]
+    fn an_undock_heads_away_from_the_station() {
+        // Type 3870: the orientation leads out of the bay, so it is kept.
+        let h = undock_heading(Vec3::new(6765.0, 938.0, 0.0), Vec3::new(6947.0, -2257.0, 0.0));
+        assert!((h - Vec3::new(6947.0, -2257.0, 0.0).unit()).len() < 1e-9);
+        // Type 56: the orientation runs down the hull; leave through the entry.
+        let h = undock_heading(Vec3::new(0.0, -198.0, 4800.0), Vec3::new(0.0, -4967.0, 0.0));
+        assert!((h - Vec3::new(0.0, -198.0, 4800.0).unit()).len() < 1e-9);
+        // Types 58/59: no entry offset, only an orientation.
+        assert_eq!(undock_heading(Vec3::ZERO, Vec3::new(0.0, 0.0, -1.0)), Vec3::new(0.0, 0.0, -1.0));
     }
 }

@@ -13,7 +13,7 @@ use tracing::{debug, info};
 
 use std::collections::BTreeMap;
 
-use crate::ballpark::{Command, Park, Ship};
+use crate::ballpark::{Command, Park, Ship, Vec3};
 use crate::combat::{self, attr, Action, Active, Afflictions, Damage, Lock, Shot, REPEAT_FOREVER};
 use crate::heartbeat::{Job, Out};
 use crate::npc::combat_ref::Attacker;
@@ -26,10 +26,13 @@ const LOCK_SLACK: f64 = 1.1;
 /// Mining reaches a little past its range, for the same reason.
 const RANGE_SLACK: f64 = 1.1;
 const GROUP_CAPSULE: i64 = 29;
+/// A tower whose shield falls below this fraction goes reinforced.
+const REINFORCE_BELOW: f64 = 0.25;
 
 pub fn step(park: &mut Park, now: i64, out: &mut Out) {
     locks(park, now, out);
     cycles(park, now, out);
+    crate::guard::step(park, now, out);
     missiles(park, now, out);
     afflict(park, out);
     npc::think(park, now, out);
@@ -51,7 +54,7 @@ fn locks(park: &mut Park, now: i64, out: &mut Out) {
         for (&t, &lock) in &fight.locks {
             let gone = match park.ships.get(&t) {
                 Some(target) => target.in_warp(),
-                None => !park.rocks.contains_key(&t),
+                None => !park.rocks.contains_key(&t) && !park.structures.contains_key(&t),
             };
             let far = park.surface_distance(id, t).map_or(true, |d| d > fight.lock_range() * LOCK_SLACK);
             if gone || far || ship.in_warp() || fight.afflictions.jammed {
@@ -293,6 +296,9 @@ fn aggress(park: &mut Park, attacker: i64, target: i64, now: i64, out: &mut Out)
 /// warp is stopped.
 fn afflict(park: &mut Park, out: &mut Out) {
     let mut on: BTreeMap<i64, Vec<Action>> = BTreeMap::new();
+    for (t, action) in crate::guard::holding(park) {
+        on.entry(t).or_default().push(action);
+    }
     for ship in park.ships.values() {
         let Some(fight) = &ship.fight else { continue };
         for m in fight.modules.iter().filter(|m| m.landed && m.cycles > 0) {
@@ -437,12 +443,23 @@ fn attacker(ship: &Ship, weapon: &Active) -> Attacker {
     }
 }
 
+/// Where something that can be shot is, how fast it moves and how big it
+/// looks: a ship in the fight, or a starbase structure.
+fn target_profile(park: &Park, id: i64) -> Option<(Vec3, Vec3, f64)> {
+    if let Some(s) = park.structures.get(&id) {
+        let signature = if s.signature > 0.0 { s.signature } else { s.radius };
+        return Some((s.pos, Vec3::ZERO, signature));
+    }
+    let ship = park.ships.get(&id)?;
+    Some((ship.pos, ship.vel, ship.fight.as_ref()?.sig()))
+}
+
 fn shoot(park: &mut Park, ship_id: i64, m: &Active, damage: Damage, gun: &combat::Gun, now: i64, out: &mut Out) {
     let Some(t) = m.target else { return };
-    let (Some(shooter), Some(target)) = (park.ships.get(&ship_id), park.ships.get(&t)) else { return };
-    let Some(signature) = target.fight.as_ref().map(|f| f.sig()) else { return };
+    let Some(shooter) = park.ships.get(&ship_id) else { return };
+    let Some((target_pos, target_vel, signature)) = target_profile(park, t) else { return };
     let Some(distance) = park.surface_distance(ship_id, t) else { return };
-    let angular = combat::angular_velocity(shooter.pos, shooter.vel, target.pos, target.vel);
+    let angular = combat::angular_velocity(shooter.pos, shooter.vel, target_pos, target_vel);
     // A tracking disruptor on the shooter shortens and slows its guns.
     let disrupted = shooter.fight.as_ref().map_or(Afflictions::default(), |f| f.afflictions);
     let gun = combat::Gun {
@@ -494,9 +511,8 @@ fn missiles(park: &mut Park, now: i64, out: &mut Out) {
         if !m.reaches {
             continue;
         }
-        let Some(target) = park.ships.get(&m.target) else { continue };
-        let Some(signature) = target.fight.as_ref().map(|f| f.sig()) else { continue };
-        let factor = combat::missile_factor(m.cloud, m.aoe_velocity, signature, target.vel.len());
+        let Some((_, velocity, signature)) = target_profile(park, m.target) else { continue };
+        let factor = combat::missile_factor(m.cloud, m.aoe_velocity, signature, velocity.len());
         let quality = match factor {
             f if f >= 0.99 => 3,
             f if f >= 0.5 => 2,
@@ -507,9 +523,19 @@ fn missiles(park: &mut Park, now: i64, out: &mut Out) {
     }
 }
 
+/// A shot from something that is not a ship module (a starbase defence).
+#[allow(clippy::too_many_arguments)]
+pub fn hit_by(park: &mut Park, by: Attacker, target: i64, damage: Damage, shot: Shot, weapon: &str, now: i64, out: &mut Out) {
+    hit(park, by, target, damage, shot, weapon, now, out);
+}
+
 /// Puts a shot's damage on its target and tells both sides how it went.
 #[allow(clippy::too_many_arguments)]
 fn hit(park: &mut Park, by: Attacker, target: i64, damage: Damage, shot: Shot, weapon: &str, now: i64, out: &mut Out) {
+    if park.structures.contains_key(&target) {
+        hit_structure(park, by, target, damage, shot, weapon, now, out);
+        return;
+    }
     let Some(victim) = park.ships.get_mut(&target) else { return };
     let Some(fight) = victim.fight.as_mut() else { return };
     let dealt = match shot {
@@ -528,6 +554,12 @@ fn hit(park: &mut Park, by: Attacker, target: i64, damage: Damage, shot: Shot, w
         out.hurt(target);
     }
 
+    tell_shot(&by, target, victim_client, shot, dealt, weapon, out);
+    aggress(park, by.ship_id, target, now, out);
+}
+
+/// OnDamageMessage to the shooter, and to the victim's pilot if it has one.
+fn tell_shot(by: &Attacker, target: i64, victim_client: Option<i64>, shot: Shot, dealt: f64, weapon: &str, out: &mut Out) {
     let key = match shot {
         Shot::Miss(q) => format!("AttackMiss{q}"),
         Shot::Hit { quality, .. } => format!("AttackHit{quality}"),
@@ -548,7 +580,31 @@ fn hit(park: &mut Park, by: Attacker, target: i64, damage: Damage, shot: Shot, w
         let pairs = vec![("source", Value::Int(by.ship_id)), ("damage", Value::Double(dealt))];
         out.note(client, "OnDamageMessage", message(format!("{key}R"), pairs));
     }
-    aggress(park, by.ship_id, target, now, out);
+}
+
+/// A starbase structure takes a shot. A reinforced tower shrugs it off; an
+/// online tower whose shield falls below a quarter asks to be reinforced.
+#[allow(clippy::too_many_arguments)]
+fn hit_structure(park: &mut Park, by: Attacker, target: i64, damage: Damage, shot: Shot, weapon: &str, now: i64, out: &mut Out) {
+    let system = park.solar_system_id;
+    let Some(s) = park.structures.get_mut(&target) else { return };
+    let dealt = match shot {
+        Shot::Hit { .. } if !s.invulnerable() => s.vitals.apply(now, damage).total,
+        _ => 0.0,
+    };
+    s.last_attacker = Some((by.char_id, by.ship_id));
+    if dealt > 0.0 {
+        out.hurt(target);
+    }
+    let (shield, ..) = s.vitals.damage_state(now);
+    if s.is_tower() && !s.invulnerable() && !s.reinforce_asked && shield < REINFORCE_BELOW
+        && s.fully_online(crate::bulkdata::filetime_now())
+    {
+        s.reinforce_asked = true;
+        out.jobs.push(Job::Reinforce { system, tower: target });
+    }
+    tell_shot(&by, target, None, shot, dealt, weapon, out);
+    crate::concord::aggress_structure(park, by.ship_id, target, now, out);
 }
 
 fn heal(park: &mut Park, ship_id: i64, _now: i64, out: &mut Out, f: impl FnOnce(&mut combat::Vitals)) {
@@ -599,6 +655,7 @@ fn mine(park: &mut Park, ship_id: i64, m: &Active, amount: f64, range: f64, out:
 // ---- losses ---------------------------------------------------------------------------------
 
 fn deaths(park: &mut Park, now: i64, out: &mut Out) {
+    structure_deaths(park, now, out);
     let dead: Vec<i64> = park
         .ships
         .values()
@@ -646,6 +703,35 @@ fn deaths(park: &mut Park, now: i64, out: &mut Out) {
     }
 }
 
+/// Starbase structures shot to pieces: they go, with what they held; a tower
+/// takes its structures offline as it goes.
+fn structure_deaths(park: &mut Park, now: i64, out: &mut Out) {
+    let dead: Vec<i64> = park.structures.values().filter(|s| s.destroyed()).map(|s| s.id).collect();
+    let system = park.solar_system_id;
+    for id in dead {
+        out.destiny(system, entry(park.tick, "TerminalExplosion", vec![Value::Int(id)]));
+        out.destiny(system, entry(park.tick, "RemoveBalls", vec![Value::List(vec![Value::Int(id)])]));
+        let Some(s) = park.structures.remove(&id) else { continue };
+        if let Some(f) = &s.field {
+            out.destiny(system, entry(park.tick, "RemoveBalls", vec![Value::List(vec![Value::Int(f.id)])]));
+        }
+        forget(park, id, now, out);
+        if s.is_tower() {
+            let tick = park.tick;
+            for other in park.structures.values_mut().filter(|o| o.tower == Some(id)) {
+                if other.drawing() {
+                    other.state = crate::pos::state::ANCHORED;
+                    other.stamp = None;
+                }
+                other.tower = None;
+                out.destiny(system, crate::pos::slim_change(tick, other));
+            }
+        }
+        info!("{} ({id}) destroyed by {}", s.name, culprit(park, s.last_attacker));
+        out.jobs.push(Job::StructureLost { id, tower: s.is_tower() });
+    }
+}
+
 /// Who `last_attacker` was, for the log: the ship's name if it is still
 /// here, else its pilot or ship ID.
 fn culprit(park: &Park, killer: Option<(i64, i64)>) -> String {
@@ -683,6 +769,18 @@ pub fn stand_down(park: &mut Park, ship_id: i64, now: i64, out: &mut Out) {
 /// whoever it had locked hears it let go.
 pub fn detach(park: &mut Park, id: i64, now: i64, out: &mut Out) -> Option<Ship> {
     let ship = park.ships.remove(&id)?;
+    forget(park, id, now, out);
+    if let Some(fight) = &ship.fight {
+        for t in fight.locked() {
+            tell_target_lost(park, id, t, out);
+        }
+    }
+    Some(ship)
+}
+
+/// Something left the park: whoever had it locked loses it, modules aimed at
+/// it stop and missiles at it fizzle.
+fn forget(park: &mut Park, id: i64, now: i64, out: &mut Out) {
     let mut stops = Vec::new();
     for other in park.ships.values_mut() {
         if let Some(brain) = other.npc.as_mut() {
@@ -698,12 +796,6 @@ pub fn detach(park: &mut Park, id: i64, now: i64, out: &mut Out) -> Option<Ship>
         stop(park, ship_id, module_id, now, out, None);
     }
     park.missiles.retain(|m| m.target != id);
-    if let Some(fight) = &ship.fight {
-        for t in fight.locked() {
-            tell_target_lost(park, id, t, out);
-        }
-    }
-    Some(ship)
 }
 
 // ---- telling -------------------------------------------------------------------------------
@@ -711,7 +803,13 @@ pub fn detach(park: &mut Park, id: i64, now: i64, out: &mut Out) -> Option<Ship>
 /// OnDamageStateChange to the system for everyone hurt (or healed) this pulse,
 /// and the pilot's own gauges (and capacitor) as attribute changes.
 fn report(park: &Park, now: i64, out: &mut Out) {
-    let (hurt, drained) = out.take_marks(|id| park.ships.contains_key(&id));
+    let (hurt, drained) = out.take_marks(|id| park.ships.contains_key(&id) || park.structures.contains_key(&id));
+    for id in &hurt {
+        let Some(s) = park.structures.get(id) else { continue };
+        out.destiny(park.solar_system_id, entry(park.tick, "OnDamageStateChange", vec![Value::Int(*id), damage_state(&s.vitals, now)]));
+        let v = &s.vitals;
+        out.jobs.push(Job::StructureDamage { id: *id, shield: v.shield.at(now), armor: v.armor_damage, hull: v.hull_damage });
+    }
     for id in &hurt {
         let Some(ship) = park.ships.get(id) else { continue };
         let Some(fight) = &ship.fight else { continue };

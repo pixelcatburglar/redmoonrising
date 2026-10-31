@@ -13,6 +13,15 @@ pub struct Config {
     pub strings: PathBuf,
     /// `RMR_DUMP_DIR`: where undecodable frames are saved.
     pub dump_dir: PathBuf,
+    /// `RMR_ALLIANCE_JOIN_DELAY`: seconds from an alliance accepting a
+    /// corporation to the membership taking effect (the client says 24 hours).
+    pub alliance_join_delay_secs: i64,
+    /// `RMR_STARBASE_SPEEDUP`: how many times faster than the client's own
+    /// timers structures anchor, online and unanchor (1: as the client says).
+    pub starbase_speedup: f64,
+    /// `RMR_SOV_CLAIM_DELAY`: seconds a tower's claim must stand before it
+    /// counts toward sovereignty (the claim tab says up to six days).
+    pub sov_claim_delay_secs: i64,
 }
 
 impl Config {
@@ -33,6 +42,18 @@ impl Config {
             )
             .into(),
             dump_dir: var("RMR_DUMP_DIR", ".").into(),
+            alliance_join_delay_secs: {
+                let delay = var("RMR_ALLIANCE_JOIN_DELAY", "86400");
+                delay.parse().map_err(|_| format!("RMR_ALLIANCE_JOIN_DELAY is not a number of seconds: {delay:?}"))?
+            },
+            starbase_speedup: {
+                let speedup = var("RMR_STARBASE_SPEEDUP", "1");
+                speedup.parse().map_err(|_| format!("RMR_STARBASE_SPEEDUP is not a number: {speedup:?}"))?
+            },
+            sov_claim_delay_secs: {
+                let delay = var("RMR_SOV_CLAIM_DELAY", "518400");
+                delay.parse().map_err(|_| format!("RMR_SOV_CLAIM_DELAY is not a number of seconds: {delay:?}"))?
+            },
         })
     }
 
@@ -65,6 +86,9 @@ mod tests {
             node_id: 1,
             strings: PathBuf::new(),
             dump_dir: PathBuf::new(),
+            alliance_join_delay_secs: 0,
+            starbase_speedup: 1.0,
+            sov_claim_delay_secs: 0,
         }
     }
 

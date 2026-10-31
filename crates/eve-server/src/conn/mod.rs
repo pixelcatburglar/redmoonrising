@@ -40,6 +40,10 @@ pub struct Server {
     pub services: services::Registry,
     pub world: World,
     pub dump_dir: PathBuf,
+    /// Seconds before an accepted alliance application takes effect.
+    pub alliance_join_delay_secs: i64,
+    /// Seconds a tower's claim stands before it counts toward sovereignty.
+    pub sov_claim_delay_secs: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -167,6 +171,11 @@ impl Conn {
                 let server = Arc::clone(&self.server);
                 tokio::spawn(async move { inflight::save_vitals(&server.db, ship_id, &fight, true).await });
             }
+        }
+        // Trades end when a trader goes.
+        if let Some(char_id) = self.session.char_id {
+            let server = Arc::clone(&self.server);
+            tokio::spawn(async move { crate::svc::pvptrade::left_station(&server.db_url, &server.world, char_id).await });
         }
         let who = chat::who(&self.session);
         for (channel, members) in channels {
@@ -354,6 +363,7 @@ impl Conn {
             corp_id: self.session.corp_id?,
             solar_system_id: self.session.solar_system_id2?,
             docked: self.session.station_id.is_some(),
+            station_id: self.session.station_id,
         })
     }
 

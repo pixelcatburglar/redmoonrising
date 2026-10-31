@@ -8,7 +8,7 @@
 //! if mode != RIGID:  f64 mass  u8 cloak  i64 harmonic  i32 corporationID  i32 allianceID
 //! if flags & FREE:   f64 maxVelocity  f64 vx,vy,vz  f64 agility  f64 speedFraction
 //! u8 formationID     (0xFF = none)
-//! <per-mode payload> (empty for STOP and RIGID, the only modes written here)
+//! <per-mode payload> (empty for STOP, FIELD and RIGID, the only modes written here)
 //! u8 nameLength  u16[nameLength] name (UTF-16LE)
 //! ```
 //!
@@ -27,6 +27,9 @@ pub mod mode {
     pub const STOP: u8 = 2;
     pub const WARP: u8 = 3;
     pub const ORBIT: u8 = 4;
+    /// A force field: solid to every ball without its harmonic, corporation
+    /// or alliance (Partition.cpp's harmonics test; destiny 2.10 0x10028d40).
+    pub const FIELD: u8 = 10;
     pub const RIGID: u8 = 11;
 }
 
@@ -48,7 +51,7 @@ pub mod flags {
 }
 
 const NO_FORMATION: u8 = 0xFF;
-const NO_HARMONIC: i64 = -1;
+pub const NO_HARMONIC: i64 = -1;
 
 #[derive(Debug, Clone)]
 pub struct Ball {
@@ -61,6 +64,8 @@ pub struct Ball {
     pub mass: f64,
     pub corp_id: i32,
     pub alliance_id: i32,
+    /// Only for non-rigid balls: -1 for none, -2 passes every field.
+    pub harmonic: i64,
     /// Only for free balls.
     pub max_velocity: f64,
     pub velocity: (f64, f64, f64),
@@ -81,6 +86,7 @@ impl Ball {
             mass: 0.0,
             corp_id: -1,
             alliance_id: -1,
+            harmonic: NO_HARMONIC,
             max_velocity: 0.0,
             velocity: (0.0, 0.0, 0.0),
             agility: 1.0,
@@ -102,8 +108,8 @@ pub fn encode(state_stamp: u32, balls: &[Ball]) -> Vec<u8> {
 
 fn write_ball(out: &mut Vec<u8>, b: &Ball) {
     debug_assert!(
-        b.mode == mode::STOP || b.mode == mode::RIGID,
-        "only STOP and RIGID balls carry no per-mode payload"
+        matches!(b.mode, mode::STOP | mode::FIELD | mode::RIGID),
+        "only STOP, FIELD and RIGID balls carry no per-mode payload (ReadBallFromStream)"
     );
     let f64s = |out: &mut Vec<u8>, vals: &[f64]| {
         for v in vals {
@@ -118,7 +124,7 @@ fn write_ball(out: &mut Vec<u8>, b: &Ball) {
     if b.mode != mode::RIGID {
         f64s(out, &[b.mass]);
         out.push(0); // not cloaked
-        out.extend_from_slice(&NO_HARMONIC.to_le_bytes());
+        out.extend_from_slice(&b.harmonic.to_le_bytes());
         out.extend_from_slice(&b.corp_id.to_le_bytes());
         out.extend_from_slice(&b.alliance_id.to_le_bytes());
     }
@@ -158,6 +164,7 @@ mod tests {
             mass: 1_650_000.0,
             corp_id: 1_000_002,
             alliance_id: -1,
+            harmonic: NO_HARMONIC,
             max_velocity: 260.0,
             velocity: (10.0, 0.0, 0.0),
             agility: 3.1,

@@ -20,6 +20,9 @@ use crate::svc::{inflight, space};
 use crate::world::{World, WorldState};
 
 const PULSE_MS: u64 = 250;
+/// Pulses between looks at slow corporate business (alliance applications
+/// coming due): once a minute.
+const AFFAIRS_EVERY: u64 = 60_000 / PULSE_MS;
 const FLAG_CARGO: i64 = 5;
 /// market_refTypes: "Bounty Prize".
 const REF_BOUNTY_PRIZE: i32 = 17;
@@ -115,6 +118,16 @@ pub enum Job {
     DroneLost { client_id: Option<i64>, drone_id: i64 },
     /// A crime, or a kill, changed a pilot's security status by this much.
     Security { char_id: i64, delta: f64 },
+    /// A starbase structure's health after a fight.
+    StructureDamage { id: i64, shield: f64, armor: f64, hull: f64 },
+    /// A tower fell below a quarter shield and may go reinforced.
+    Reinforce { system: i64, tower: i64 },
+    /// A battery fired a round from its bay.
+    StructureAmmo { item_id: i64, quantity: i64 },
+    /// A starbase structure was destroyed.
+    StructureLost { id: i64, tower: bool },
+    /// A starbase structure finished a timed step.
+    Structure { id: i64, state: i16, stamp: Option<i64>, tower: Option<i64> },
 }
 
 pub async fn run(server: Arc<Server>) {
@@ -127,13 +140,26 @@ pub async fn run(server: Arc<Server>) {
             }
         }
     };
+    crate::svc::pvptrade::recover(&db).await;
     info!("heartbeat every {PULSE_MS} ms");
     let mut interval = tokio::time::interval(Duration::from_millis(PULSE_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pulses = 0u64;
     loop {
         interval.tick().await;
         for job in pulse(&server.world, combat::now_ms()) {
             perform(&server, &mut db, job).await;
+        }
+        pulses += 1;
+        if pulses % AFFAIRS_EVERY == 1 {
+            crate::svc::alliance::take_effect(&server.world, &mut db, server.alliance_join_delay_secs).await;
+            crate::svc::alliance::bill_alliances(&db).await;
+            crate::svc::war::bill_wars(&server.world, &db).await;
+            crate::svc::starbase::burn_fuel(&server.world, &mut db).await;
+            crate::svc::starbase::sovereignty(&db, server.sov_claim_delay_secs).await;
+            crate::svc::votes::close_votes(&server.world, &db).await;
+            crate::guard::reload(&server.world, &db).await;
+            crate::guard::refresh_standings(&db).await;
         }
     }
 }
@@ -144,6 +170,7 @@ fn pulse(world: &World, now: i64) -> Vec<Job> {
     let mut out = Out::default();
     let tick = crate::destiny::tick_now();
     for park in w.parks.values_mut() {
+        crate::pos::step(park, &mut out);
         if park.players().next().is_none() {
             continue;
         }
@@ -172,6 +199,11 @@ async fn perform(server: &Server, db: &mut Client, job: Job) {
         Job::DroneHome { client_id, drone_id, ship_id } => crate::drones::home(server, db, client_id, drone_id, ship_id).await,
         Job::DroneLost { client_id, drone_id } => crate::drones::lost(server, db, client_id, drone_id).await,
         Job::Security { char_id, delta } => change_security(db, char_id, delta).await,
+        Job::Structure { id, state, stamp, tower } => save_structure(db, id, state, stamp, tower).await,
+        Job::StructureDamage { id, shield, armor, hull } => crate::svc::starbase::save_damage(db, id, shield, armor, hull).await,
+        Job::Reinforce { system, tower } => crate::svc::starbase::reinforce(&server.world, db, system, tower).await,
+        Job::StructureLost { id, tower } => crate::svc::starbase::lost(db, id, tower).await,
+        Job::StructureAmmo { item_id, quantity } => crate::guard::save_ammo(db, item_id, quantity).await,
     }
 }
 
@@ -272,6 +304,13 @@ async fn raise_security(db: &mut Client, char_id: i64, (bonus, max_gain): (f64, 
                   WHERE "characterID" = $1 AND "securityRating" < $3"#;
     if let Err(e) = db.execute(sql, &[&(char_id as i32), &bonus, &max_gain]).await {
         error!("raising the security status of {char_id}: {}", crate::logging::chain(&e));
+    }
+}
+
+async fn save_structure(db: &mut Client, id: i64, state: i16, stamp: Option<i64>, tower: Option<i64>) {
+    let sql = r#"UPDATE "posStructures" SET "state" = $2, "stateTimestamp" = $3, "controlTowerID" = $4 WHERE "itemID" = $1"#;
+    if let Err(e) = db.execute(sql, &[&(id as i32), &state, &stamp, &tower.map(|t| t as i32)]).await {
+        error!("saving structure {id}: {}", crate::logging::chain(&e));
     }
 }
 

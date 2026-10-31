@@ -58,6 +58,23 @@ pub fn index_rowset(header: &[&str], id_name: &str, items: Vec<(Value, Value)>) 
     }
 }
 
+/// The `{column: (old, new)}` dict the client's On*Changed handlers take
+/// (bco_base.GetAddRemoveFromChange): a row added (`old` None) or removed
+/// (`new` None) carries every column, an update only the ones that differ.
+pub fn change(header: &[&str], old: Option<&[Value]>, new: Option<&[Value]>) -> Value {
+    let at = |l: Option<&[Value]>, i: usize| l.and_then(|l| l.get(i)).cloned().unwrap_or(Value::None);
+    let whole = old.is_none() || new.is_none();
+    Value::Dict(
+        header
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (Value::bytes(*h), (at(old, i), at(new, i))))
+            .filter(|(_, (o, n))| whole || o != n)
+            .map(|(k, (o, n))| (k, Value::Tuple(vec![o, n])))
+            .collect(),
+    )
+}
+
 pub fn header_value(header: &[&str]) -> Value {
     Value::List(header.iter().map(|h| Value::bytes(*h)).collect())
 }

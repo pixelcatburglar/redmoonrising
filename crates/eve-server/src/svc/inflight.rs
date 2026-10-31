@@ -306,6 +306,7 @@ fn add_target(ctx: &Ctx<'_>, target: i64) -> Outcome {
             .get(&target)
             .map(|s| s.pilot.name.clone())
             .or_else(|| park.rocks.get(&target).map(|r| r.name.clone()))
+            .or_else(|| park.structures.get(&target).map(|s| s.name.clone()))
             .or_else(|| park.celestial(target).map(|c| c.name.clone()));
         let Some(name) = name else {
             return Err(user_error("TargetCantValidate", Vec::new()));
@@ -516,7 +517,7 @@ fn check_target(park: &crate::ballpark::Park, ship_id: i64, m: &Active) -> Resul
     let Some(t) = m.target else { return Ok(()) };
     match m.action {
         Action::Turret { .. } | Action::Missile { .. } => {
-            if !park.ships.get(&t).is_some_and(|s| s.fight.is_some()) {
+            if !park.ships.get(&t).is_some_and(|s| s.fight.is_some()) && !park.structures.contains_key(&t) {
                 return Err("That is not something you can shoot.".into());
             }
         }
@@ -572,9 +573,6 @@ fn plan(loadout: &Loadout<'_>, item_id: i64, effect: &EffectRow, target: Option<
     let duration = effect.duration_attr.map_or(0.0, v);
     if duration <= 0.0 {
         return Err("That module has no cycle to run.".into());
-    }
-    if effect.category == TARGETED && target.is_none() {
-        return Err("That module needs a target.".into());
     }
     let charge = loadout.charge_of(i);
     let burns = |per_cycle: i64| {
@@ -654,7 +652,14 @@ fn plan(loadout: &Loadout<'_>, item_id: i64, effect: &EffectRow, target: Option<
         effect::TARGET_PAINT | effect::TARGET_PAINT_2 => Action::Paint(1.0 + v(attr::SIGNATURE_RADIUS_BONUS) / 100.0),
         _ => Action::Passive,
     };
-    let reach = action.projected().then(|| (effect.range_attr.map_or(0.0, v), effect.falloff_attr.map_or(0.0, v)));
+    // A launcher's useMissiles is an activation effect: the target belongs to
+    // its charge's missileLaunching, and the client sends it for that
+    // (shipmodulebutton.ActivateEffect).
+    let targeted = effect.category == TARGETED || matches!(action, Action::Missile { .. });
+    if targeted && target.is_none() {
+        return Err("That module needs a target.".into());
+    }
+    let reach =action.projected().then(|| (effect.range_attr.map_or(0.0, v), effect.falloff_attr.map_or(0.0, v)));
     if action.projected() && effect.category != TARGETED {
         return Err("That module works on a target.".into());
     }
@@ -670,7 +675,7 @@ fn plan(loadout: &Loadout<'_>, item_id: i64, effect: &EffectRow, target: Option<
         guid,
         offensive: effect.offensive,
         action,
-        target: if effect.category == TARGETED { target } else { None },
+        target: if targeted { target } else { None },
         ammo: None,
         duration_ms: duration as i64,
         cap_need: effect.discharge_attr.map_or(0.0, v).max(0.0),

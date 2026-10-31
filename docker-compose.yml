@@ -31,6 +31,12 @@ services:
         condition: service_healthy
     environment:
       RMR_DATABASE: postgres://rmr:rmr@postgres:5432/rmr
+      # Seconds before an accepted alliance application takes effect (24 h).
+      RMR_ALLIANCE_JOIN_DELAY: "86400"
+      # How many times faster than normal structures anchor, online and unanchor.
+      RMR_STARBASE_SPEEDUP: "1"
+      # Seconds a tower's claim stands before it counts toward sovereignty (6 days).
+      RMR_SOV_CLAIM_DELAY: "518400"
     ports:
       - "26000:26000"
     init: true
