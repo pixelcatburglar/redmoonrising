@@ -95,6 +95,13 @@ pub async fn handle(server: &Server, db: &mut Client, loss: Loss) {
     record(server, db, &loss, report, destroyed).await;
 }
 
+/// A bot's ship destroyed: the kill log and the killmail, as for a player.
+/// The rest (a new ship, waking at home) is the bot simulation's.
+pub async fn bot_lost(server: &Server, db: &mut Client, loss: Loss) {
+    let report = report_text(db, &loss).await;
+    record(server, db, &loss, report, Vec::new()).await;
+}
+
 // ---- the ship -----------------------------------------------------------------------------
 
 /// Returns what was destroyed, by type name, for the killmail.

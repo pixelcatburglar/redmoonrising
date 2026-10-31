@@ -108,6 +108,8 @@ pub enum Job {
     Refit { client_id: i64, char_id: i64, ship_id: i64, system: i64 },
     /// A player's ship (or capsule) was destroyed.
     Lost(Box<crate::losses::Loss>),
+    /// A bot's ship was destroyed.
+    BotLost(Box<crate::losses::Loss>),
     /// Something was killed with loot on it.
     Loot { system: i64, pos: Vec3, owner_id: i64, stash: Vec<crate::loot::Stash> },
     /// A can's time ran out.
@@ -196,6 +198,7 @@ async fn perform(server: &Server, db: &mut Client, job: Job) {
             inflight::refit(db, &server.dogma, &server.world, client_id, char_id, ship_id, system).await
         }
         Job::Lost(loss) => crate::losses::handle(server, db, *loss).await,
+        Job::BotLost(loss) => crate::losses::bot_lost(server, db, *loss).await,
         Job::Loot { system, pos, owner_id, stash } => crate::loot::drop_can(db, &server.world, system, pos, owner_id, stash).await,
         Job::Scrap { can_id } => crate::loot::scrap(db, can_id).await,
         Job::DroneHome { client_id, drone_id, ship_id } => crate::drones::home(server, db, client_id, drone_id, ship_id).await,

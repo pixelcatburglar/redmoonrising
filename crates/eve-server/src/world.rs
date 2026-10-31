@@ -94,6 +94,28 @@ pub struct WorldState {
     /// Solar system -> its ballpark. Created when the first ship arrives.
     pub parks: HashMap<i64, Park>,
     pub gangs: crate::svc::gang::Gangs,
+    /// The online bots by solar system: (in space, docked), for the star map.
+    pub bot_counts: HashMap<i64, (i64, i64)>,
+    /// How the bot population stands, for the web dashboard.
+    pub bot_stats: BotStats,
+}
+
+/// The bot population at its last save.
+#[derive(Debug, Clone, Default)]
+pub struct BotStats {
+    pub total: i64,
+    pub online: i64,
+    pub in_space: i64,
+    pub corporations: i64,
+    pub alliances: i64,
+    pub wars: i64,
+    /// Bots lost in fights since the server started.
+    pub lost: u64,
+    /// Bots lost in each bot war, by warID.
+    pub war_losses: HashMap<i64, u32>,
+    /// What happened in null-sec lately, oldest first: (FILETIME, what).
+    pub news: Vec<(i64, String)>,
+    pub running: bool,
 }
 
 /// A handle on the shared world; clones share it, for tasks that outlive a call.
@@ -149,6 +171,18 @@ impl WorldState {
             .collect()
     }
 
+    /// Where each player in the game is.
+    pub fn players(&self) -> Vec<Presence> {
+        self.clients.values().filter_map(|c| c.presence).collect()
+    }
+
+    /// Characters in the game: players logged in, and the bots online.
+    pub fn online_count(&self) -> i64 {
+        let players = self.clients.values().filter(|c| c.presence.is_some()).count() as i64;
+        let bots: i64 = self.bot_counts.values().map(|(space, docked)| space + docked).sum();
+        players + bots
+    }
+
     /// Clients whose session holds every bit of `role`.
     pub fn with_role(&self, role: i64) -> Vec<i64> {
         self.clients.iter().filter(|(_, c)| c.presence.is_some_and(|p| p.role & role == role)).map(|(id, _)| *id).collect()
@@ -183,6 +217,12 @@ impl WorldState {
                 *docked.entry(p.solar_system_id).or_insert(0) += 1;
             } else {
                 *in_space += 1;
+            }
+        }
+        for (system, (in_space, in_station)) in &self.bot_counts {
+            *space.entry(*system).or_insert(0) += in_space;
+            if *in_station > 0 {
+                *docked.entry(*system).or_insert(0) += in_station;
             }
         }
         (space, docked)

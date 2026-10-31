@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RMR Server Status</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <nav class="neocom" aria-label="Windows">
+    <a href="#w-status" title="Server Status">STA</a>
+    <a href="#w-wars" title="War Report">WAR</a>
+    <a href="#w-pilots" title="Pilots Online">PIL</a>
+    <a href="#w-systems" title="Busiest Systems">MAP</a>
+    <a href="#w-alliances" title="Alliances">ALL</a>
+    <a href="#w-corporations" title="Corporations">CRP</a>
+    <a href="#w-news" title="Galactic News">NEW</a>
+    <a href="#w-kills" title="Kill Reports">KIL</a>
+    <div class="clock" title="EVE time (UTC)"><span id="clock-time">--:--</span><span id="clock-date"></span></div>
+  </nav>
+
+  <main class="desktop">
+    <section class="window narrow" id="w-status">
+      <header class="caption"><span class="glyph"></span><h2>Server Status</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body">
+        <p class="statusline" id="statusline">STATUS: CONNECTING…</p>
+        <dl class="info" id="status"></dl>
+      </div>
+    </section>
+
+    <section class="window wide" id="w-wars">
+      <header class="caption"><span class="glyph"></span><h2>War Report</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body"><table id="wars"></table></div>
+    </section>
+
+    <section class="window" id="w-pilots">
+      <header class="caption"><span class="glyph"></span><h2>Pilots Online</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body"><table id="players"></table></div>
+    </section>
+
+    <section class="window" id="w-systems">
+      <header class="caption"><span class="glyph"></span><h2>Busiest Systems</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body"><table id="systems"></table></div>
+    </section>
+
+    <section class="window" id="w-alliances">
+      <header class="caption"><span class="glyph"></span><h2>Alliances</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body"><table id="alliances"></table></div>
+    </section>
+
+    <section class="window" id="w-corporations">
+      <header class="caption"><span class="glyph"></span><h2>Corporations</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body"><table id="corporations"></table></div>
+    </section>
+
+    <section class="window" id="w-news">
+      <header class="caption"><span class="glyph"></span><h2>Galactic News</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body"><table id="news"></table></div>
+    </section>
+
+    <section class="window wide" id="w-kills">
+      <header class="caption"><span class="glyph"></span><h2>Kill Reports</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body"><table id="kills"></table></div>
+    </section>
+  </main>
+</body>
+</html>

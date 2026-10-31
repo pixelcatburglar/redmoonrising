@@ -78,7 +78,7 @@ impl Watch {
 fn pilot_of(ship: &Ship) -> Option<i64> {
     match &ship.drone {
         Some(d) => Some(d.owner),
-        None if ship.is_player() => Some(ship.pilot.char_id),
+        None if ship.is_pilot() => Some(ship.pilot.char_id),
         None => None,
     }
 }

@@ -20,6 +20,9 @@ use crate::world::Move;
 const JUMP_RANGE: f64 = 2_500.0;
 /// The client runs its own simulation; allow for the two drifting apart.
 const RANGE_SLACK: f64 = 1.25;
+/// How long the gate's flash and the ship's jump-out play before the ship
+/// is gone. Their length is in the effects' models; this is a choice.
+const JUMP_OUT_TIME: Duration = Duration::from_secs(3);
 /// Close enough to a station's surface to be towed in.
 const DOCK_RANGE: f64 = 2_500.0;
 /// The longest a docking approach may take before the request is refused.
@@ -297,14 +300,23 @@ impl Conn {
             return self.send_error(req, err).await;
         };
 
-        // Leave: everyone here sees the jump flash, then the ship goes.
-        let ship = {
-            let mut world = self.server.world.lock();
+        // Leave: the gate lights up and the ship jumps out, for everyone here
+        // and for the pilot ("Jumping", spaceMgr.py:123); it goes once that
+        // has played.
+        {
+            let world = self.server.world.lock();
             let tick = world.parks.get(&system_id).map_or(destiny::tick_now(), |p| p.tick);
-            let flash = space::special_fx(tick, ship_id, Some(from_gate), "effects.JumpOut");
-            space::broadcast(&world, system_id, None, vec![flash]);
-            space::remove_ship(&mut world, system_id, ship_id)
+            let gate = space::special_fx(tick, from_gate, None, "effects.GateActivity");
+            let out = space::special_fx(tick, ship_id, Some(from_gate), "effects.JumpOut");
+            space::broadcast(&world, system_id, None, vec![gate, out]);
+        }
+        tokio::time::sleep(JUMP_OUT_TIME).await;
+        let ship = space::remove_ship(&mut self.server.world.lock(), system_id, ship_id);
+        let Some(ship) = ship else {
+            warn!("jump: ship {ship_id} was lost before it could jump");
+            return self.send_error(req, custom_error("Your ship is no longer in space.")).await;
         };
+        let ship = Some(ship);
 
         let before = self.session.clone();
         self.session.solar_system_id = Some(jump.solar_system_id);
@@ -330,6 +342,7 @@ impl Conn {
             ship.pos = jump.arrival;
             ship.vel = Vec3::ZERO;
             ship.command = Command::Stop;
+            ship.arrived_through = Some(to_gate);
             let mut world = self.server.world.lock();
             space::add_ship(&mut world, jump.solar_system_id, ship);
             let tick = world.parks.get(&jump.solar_system_id).map_or(destiny::tick_now(), |p| p.tick);

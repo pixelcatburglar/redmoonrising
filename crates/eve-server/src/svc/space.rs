@@ -426,6 +426,25 @@ pub fn add_ship(world: &mut WorldState, system: i64, ship: Ship) {
     world.notify(&others, "DoDestinyUpdate", args);
 }
 
+/// Gives a ship in a park a new course and tells the system (a warp opens
+/// the throttle first, as destiny wants).
+pub fn order(world: &mut WorldState, system: i64, ship_id: i64, command: Command) {
+    let Some(park) = world.parks.get_mut(&system) else { return };
+    park.advance(destiny::tick_now());
+    if !park.ships.contains_key(&ship_id) {
+        return;
+    }
+    let tick = park.tick;
+    let mut entries = Vec::new();
+    if matches!(command, Command::Warp { .. }) && park.ships[&ship_id].speed_fraction < 1.0 {
+        park.set_speed_fraction(ship_id, 1.0);
+        entries.push(entry(tick, "SetSpeedFraction", vec![Value::Int(ship_id), Value::Double(1.0)]));
+    }
+    park.command(ship_id, command);
+    entries.insert(0, command_entry(&park.ships[&ship_id], tick));
+    broadcast(world, system, None, entries);
+}
+
 /// Takes a ship out of its system's park, out of everyone's view and out of
 /// every fight it was in; returns it.
 pub fn remove_ship(world: &mut WorldState, system: i64, ship_id: i64) -> Option<Ship> {
@@ -456,10 +475,15 @@ async fn push_set_state(ctx: &Ctx<'_>) {
     if !park.ships.contains_key(&ship_id) {
         warn!("SetState for ship {ship_id}, which is not in the park of {system}");
     }
+    // Just out of a gate: the pilot sees the arrival too, once their park is up.
+    let arrival = park.ships.get_mut(&ship_id).and_then(|s| s.arrived_through.take());
     let pilots: Vec<i64> = park.ships.values().map(|s| s.pilot.char_id).filter(|c| *c != 0).collect();
     let char_gangs = world.gangs.memberships(pilots);
     let Some(park) = world.parks.get(&system) else { return };
-    let entries = set_state_entries(park, ship_id, &owners, &char_gangs);
+    let mut entries = set_state_entries(park, ship_id, &owners, &char_gangs);
+    if let Some(gate) = arrival {
+        entries.push(special_fx(park.tick, ship_id, Some(gate), "effects.JumpIn"));
+    }
     debug!("SetState: {} ball(s), ego {ship_id}", park.celestials.len() + park.ships.len());
     broadcast(&world, system, Some(ctx.client_id), entries);
 }

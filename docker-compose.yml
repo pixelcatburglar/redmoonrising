@@ -37,8 +37,12 @@ services:
       RMR_STARBASE_SPEEDUP: "1"
       # Seconds a tower's claim stands before it counts toward sovereignty (6 days).
       RMR_SOV_CLAIM_DELAY: "518400"
+      # How many bot characters the server plays (0: none). Made on the first start.
+      RMR_BOTS: "100000"
     ports:
       - "26000:26000"
+      # The web dashboard: this machine only, since it has no login.
+      - "127.0.0.1:8080:8080"
     init: true
     restart: unless-stopped
 

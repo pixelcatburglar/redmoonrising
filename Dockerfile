@@ -16,7 +16,8 @@ RUN useradd --system --no-create-home rmr && mkdir -p /app/dumps && chown rmr /a
 USER rmr
 WORKDIR /app
 ENV RMR_BIND=0.0.0.0:26000 \
+    RMR_WEB=0.0.0.0:8080 \
     RMR_STRINGS=/app/strings.txt \
     RMR_DUMP_DIR=/app/dumps
-EXPOSE 26000
+EXPOSE 26000 8080
 CMD ["eve-server"]

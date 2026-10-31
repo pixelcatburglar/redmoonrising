@@ -322,9 +322,7 @@ async fn create_alliance(ctx: &Ctx<'_>, name: &str, short_name: &str, descriptio
         .await
         .map_err(|e| db_failed("inserting the alliance", e))?
         .get(0);
-    tx.execute(r#"INSERT INTO alliance_shortnames ("allianceID", "shortName") VALUES ($1, $2)"#, &[&alliance_id, &short_name])
-        .await
-        .map_err(|e| db_failed("recording the short name", e))?;
+    // alliance_shortnames follows by trigger (sync_alliance_shortnames).
     join(&tx, alliance_id.into(), corp_id, now).await?;
     tx.execute(r#"DELETE FROM "allianceApplications" WHERE "corporationID" = $1"#, &[&corp32])
         .await

@@ -113,6 +113,12 @@ pub struct NpcType {
 }
 
 impl NpcType {
+    /// A type with the given attributes, for tests.
+    #[cfg(test)]
+    pub fn with(type_id: i64, group_id: i64, radius: f64, mass: f64, attrs: &[(i32, f64)]) -> NpcType {
+        NpcType { type_id, group_id, name: String::new(), radius, mass, attrs: attrs.iter().copied().collect() }
+    }
+
     pub fn get(&self, a: i32) -> f64 {
         self.attrs.get(&a).copied().unwrap_or(0.0)
     }

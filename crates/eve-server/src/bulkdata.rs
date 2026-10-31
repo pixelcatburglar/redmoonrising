@@ -121,8 +121,11 @@ pub const SPECS: &[Spec] = &[
       r#"SELECT "channelTypeID","channelTypeName","defaultName" FROM "channelTypes""#),
     empty("config.EncyclopediaTypes", Shape::Rowset,
           &["encyclopediaTypeID", "encyclopediaTypeName"]),
+    // Sent whole at login, so within the 1 MB a message may be: bots are left
+    // out (the client asks for them by GetMultiOwnersEx, which finds them).
     s("config.StaticOwners", Shape::Rowset,
-      r#"SELECT "ownerID","ownerName","typeID" FROM "eveStaticOwners""#),
+      r#"SELECT o."ownerID",o."ownerName",o."typeID" FROM "eveStaticOwners" o
+          WHERE NOT EXISTS (SELECT 1 FROM "bots" b WHERE b."characterID" = o."ownerID")"#),
     s("config.StaticLocations", Shape::Rowset,
       r#"SELECT "locationID","locationName","x","y","z" FROM "eveStaticLocations""#),
 ];

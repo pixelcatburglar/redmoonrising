@@ -232,6 +232,11 @@ pub struct Ship {
     pub drone: Option<crate::drones::Drone>,
     /// The shield harmonic its pilot set (SetShipPassword); -1 for none.
     pub harmonic: i64,
+    /// The gate it just came out of, until its pilot's SetState shows the
+    /// arrival.
+    pub arrived_through: Option<i64>,
+    /// Flown by the bot simulation: a pilot like a player's, with no client.
+    pub bot: bool,
 }
 
 impl Ship {
@@ -253,6 +258,8 @@ impl Ship {
             npc: None,
             drone: None,
             harmonic: crate::destiny::NO_HARMONIC,
+            arrived_through: None,
+            bot: false,
         }
     }
 
@@ -265,7 +272,13 @@ impl Ship {
         self.warp.is_some()
     }
 
+    /// A ship a connected player flies.
     pub fn is_player(&self) -> bool {
+        self.npc.is_none() && self.drone.is_none() && !self.bot
+    }
+
+    /// A ship with a character at the helm: a player's or a bot's.
+    pub fn is_pilot(&self) -> bool {
         self.npc.is_none() && self.drone.is_none()
     }
 
@@ -295,6 +308,10 @@ pub struct Park {
     pub structures: BTreeMap<i64, crate::pos::Structure>,
     /// Agents' mission sites, by beacon ID.
     pub sites: BTreeMap<i64, crate::sites::Site>,
+    /// Bots whose ships were destroyed here, by character, with the capsule
+    /// each ejected in (None: it was the capsule), for the bot simulation to
+    /// collect.
+    pub bot_losses: Vec<(i64, Option<i64>)>,
     /// Aggression and crime here.
     pub watch: crate::concord::Watch,
     pub belts: Vec<Belt>,
@@ -316,6 +333,7 @@ impl Park {
             cans: BTreeMap::new(),
             structures: BTreeMap::new(),
             sites: BTreeMap::new(),
+            bot_losses: Vec::new(),
             watch: Default::default(),
             belts: Vec::new(),
             missiles: Vec::new(),

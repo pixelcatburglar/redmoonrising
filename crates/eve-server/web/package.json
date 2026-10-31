@@ -1,0 +1,11 @@
+{
+  "name": "rmr-dashboard",
+  "private": true,
+  "description": "The web dashboard's page script; dist/app.js is built into eve-server.",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

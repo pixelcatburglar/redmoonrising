@@ -254,7 +254,7 @@ async fn validate_name(call: &Call, ctx: &Ctx<'_>) -> Value {
     }
 }
 
-fn name_shape_ok(name: &str) -> bool {
+pub(crate) fn name_shape_ok(name: &str) -> bool {
     name_shape_error(name).is_none()
 }
 

@@ -1,4 +1,5 @@
 mod ballpark;
+mod bots;
 mod bulkdata;
 mod combat;
 mod concord;
@@ -23,6 +24,7 @@ mod services;
 mod session;
 mod sites;
 mod svc;
+mod web;
 mod world;
 
 use std::sync::Arc;
@@ -95,6 +97,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
     pos::set_speedup(config.starbase_speedup);
     tokio::spawn(heartbeat::run(Arc::clone(&server)));
+    tokio::spawn(bots::run(Arc::clone(&server), config.bots, config.bots_speed));
+    tokio::spawn(web::run(Arc::clone(&server), config.web.clone()));
     let listener = TcpListener::bind(&config.bind).await?;
     info!("listening on {} as node {}", config.bind, config.node_id);
 

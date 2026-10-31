@@ -12,8 +12,11 @@ use crate::session::{ROLE_LOGIN, ROLE_PLAYER};
 
 impl Conn {
     /// Exchange low-level version challenges; the client sends nothing else first.
+    /// The server's carries how many are playing, which the login screen
+    /// shows as its status (login.py GetServerStatus).
     pub(super) async fn handshake(&mut self) -> Result {
-        let challenge = VersionChallenge::server(0);
+        let playing = self.server.world.lock().online_count();
+        let challenge = VersionChallenge::server(playing);
         self.write_value(&challenge.to_value()).await?;
 
         let Some(frame) = self.read_frame().await? else {

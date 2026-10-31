@@ -1,0 +1,224 @@
+/* After the EVE client of 2006: grey glass windows over space, small
+   Tahoma, uppercase captions, tight overview-style lists. */
+
+:root {
+  --glass: rgba(18, 20, 24, 0.86);
+  --glass-edge: rgba(255, 255, 255, 0.16);
+  --caption-top: #3a3e45;
+  --caption-bottom: #22252b;
+  --text: #d6d6d6;
+  --dim: #8b9099;
+  --faint: #5d626b;
+  --row-alt: rgba(255, 255, 255, 0.025);
+  --row-hover: rgba(255, 255, 255, 0.07);
+  --hostile: #d63c2e;
+  --highlight: #e8e8e8;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  color: var(--text);
+  font: 11px/1.35 Tahoma, Verdana, "Segoe UI", sans-serif;
+  background-color: #04060a;
+  /* Stars, and a little nebula. */
+  background-image:
+    radial-gradient(1px 1px at 12% 18%, rgba(255,255,255,.7) 50%, transparent 51%),
+    radial-gradient(1px 1px at 68% 32%, rgba(255,255,255,.55) 50%, transparent 51%),
+    radial-gradient(1px 1px at 34% 74%, rgba(255,255,255,.6) 50%, transparent 51%),
+    radial-gradient(1px 1px at 86% 82%, rgba(255,255,255,.5) 50%, transparent 51%),
+    radial-gradient(1px 1px at 52% 52%, rgba(200,220,255,.45) 50%, transparent 51%),
+    radial-gradient(1.5px 1.5px at 23% 58%, rgba(255,240,220,.6) 50%, transparent 51%),
+    radial-gradient(1px 1px at 92% 12%, rgba(255,255,255,.45) 50%, transparent 51%),
+    radial-gradient(ellipse 60% 45% at 78% 22%, rgba(60, 40, 90, .35), transparent 70%),
+    radial-gradient(ellipse 50% 40% at 18% 85%, rgba(20, 60, 90, .30), transparent 70%);
+  background-size: 260px 260px, 310px 310px, 230px 230px, 380px 380px, 170px 170px, 420px 420px, 290px 290px, 100% 100%, 100% 100%;
+  background-attachment: fixed;
+}
+
+/* ---- the neocom ------------------------------------------------------------ */
+
+.neocom {
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: 54px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  background: linear-gradient(90deg, rgba(30, 32, 37, .95), rgba(16, 18, 22, .95));
+  border-right: 1px solid var(--glass-edge);
+  z-index: 2;
+}
+
+.neocom a {
+  display: block;
+  padding: 11px 0;
+  text-align: center;
+  color: var(--dim);
+  text-decoration: none;
+  font-size: 9px;
+  letter-spacing: .12em;
+  border-bottom: 1px solid rgba(255, 255, 255, .05);
+}
+
+.neocom a:hover { color: var(--highlight); background: var(--row-hover); }
+
+.clock {
+  margin-top: auto;
+  padding: 10px 0 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border-top: 1px solid var(--glass-edge);
+  color: var(--highlight);
+}
+
+#clock-time { font-size: 12px; letter-spacing: .05em; }
+#clock-date { font-size: 9px; color: var(--dim); }
+
+/* ---- windows --------------------------------------------------------------- */
+
+.desktop {
+  margin-left: 54px;
+  padding: 14px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr));
+  gap: 12px;
+  align-items: start;
+  /* Smaller windows fill the holes the wide ones leave. */
+  grid-auto-flow: row dense;
+}
+
+.window {
+  background: var(--glass);
+  border: 1px solid var(--glass-edge);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .6), 0 6px 18px rgba(0, 0, 0, .55);
+  min-width: 0;
+}
+
+.window.wide { grid-column: 1 / -1; }
+
+.caption {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 20px;
+  padding: 0 4px 0 6px;
+  background: linear-gradient(180deg, var(--caption-top), var(--caption-bottom));
+  border-bottom: 1px solid rgba(0, 0, 0, .7);
+}
+
+.glyph {
+  width: 9px;
+  height: 9px;
+  border: 1px solid var(--dim);
+  background: linear-gradient(135deg, rgba(255,255,255,.35), rgba(255,255,255,0) 60%);
+}
+
+.caption h2 {
+  margin: 0;
+  flex: 1;
+  font-size: 10px;
+  font-weight: normal;
+  text-transform: uppercase;
+  letter-spacing: .14em;
+  color: var(--highlight);
+}
+
+.min {
+  width: 15px;
+  height: 13px;
+  padding: 0;
+  font: inherit;
+  font-size: 9px;
+  line-height: 9px;
+  color: var(--dim);
+  background: rgba(0, 0, 0, .35);
+  border: 1px solid rgba(255, 255, 255, .18);
+  cursor: pointer;
+}
+
+.min:hover { color: var(--highlight); border-color: rgba(255, 255, 255, .4); }
+
+.window.minimized .body { display: none; }
+
+.body {
+  max-height: 360px;
+  overflow: auto;
+  padding: 2px;
+}
+
+/* ---- the status window ----------------------------------------------------- */
+
+.statusline {
+  margin: 8px 8px 6px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--highlight);
+}
+
+.info {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  margin: 0 8px 8px;
+  border-top: 1px solid rgba(255, 255, 255, .08);
+}
+
+.info dt, .info dd {
+  margin: 0;
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, .05);
+}
+
+.info dt { color: var(--dim); padding-right: 16px; }
+.info dd { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---- lists, as in the overview ---------------------------------------------- */
+
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+
+th, td {
+  text-align: left;
+  padding: 2px 6px;
+  white-space: nowrap;
+  height: 18px;
+}
+
+th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  font-weight: normal;
+  color: var(--dim);
+  background: linear-gradient(180deg, #2c2f35, #1d1f24);
+  border-right: 1px solid rgba(0, 0, 0, .5);
+  border-bottom: 1px solid rgba(255, 255, 255, .1);
+  cursor: pointer;
+  user-select: none;
+}
+
+th:hover { color: var(--highlight); }
+th.sorted { color: var(--highlight); }
+th.sorted::after { content: " \25BE"; font-size: 9px; }
+th.sorted.up::after { content: " \25B4"; }
+
+tbody tr:nth-child(even) { background: var(--row-alt); }
+tbody tr:hover { background: var(--row-hover); }
+
+.num { text-align: right; }
+.tick { color: var(--dim); }
+.dim { color: var(--faint); }
+.hostile { color: var(--hostile); }
+.empty { color: var(--faint); padding: 8px 6px; font-style: italic; }
+.sec { display: inline-block; min-width: 22px; }
+.bot { color: var(--faint); font-size: 10px; }
+#news td:last-child { white-space: normal; }
+
+@media (max-width: 560px) {
+  .neocom { display: none; }
+  .desktop { margin-left: 0; padding: 8px; }
+}

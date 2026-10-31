@@ -691,6 +691,15 @@ fn deaths(park: &mut Park, now: i64, out: &mut Out) {
                     out.jobs.push(Job::Loot { system, pos: ship.pos, owner_id: char_id, stash });
                 }
             }
+        } else if ship.bot {
+            // As a player: a ship leaves its pilot in a capsule, a capsule
+            // leaves the pilot waking at home. Crimes count as against anyone.
+            let capsule = ship.pilot.group_id == GROUP_CAPSULE;
+            info!("bot {}'s {} {id} destroyed by {}", ship.pilot.name, if capsule { "capsule" } else { "ship" }, culprit(park, killer));
+            crate::concord::killed(park, &ship, capsule, out);
+            let pod = if capsule { None } else { crate::bots::eject(park, &ship, now, out) };
+            park.bot_losses.push((ship.pilot.char_id, pod));
+            out.jobs.push(Job::BotLost(Box::new(crate::losses::Loss::of(&ship, system, capsule))));
         } else if let Some(drone) = &ship.drone {
             info!("drone {id} of {} destroyed by {}", drone.owner, culprit(park, killer));
             out.jobs.push(Job::DroneLost { client_id: Some(drone.client_id), drone_id: id });

@@ -1,2 +1,3 @@
 tools/
 target/
+crates/eve-server/web/node_modules/

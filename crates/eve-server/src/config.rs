@@ -22,6 +22,13 @@ pub struct Config {
     /// `RMR_SOV_CLAIM_DELAY`: seconds a tower's claim must stand before it
     /// counts toward sovereignty (the claim tab says up to six days).
     pub sov_claim_delay_secs: i64,
+    /// `RMR_BOTS`: how many bot characters to play (0: none). They are made
+    /// the first time and kept.
+    pub bots: usize,
+    /// `RMR_BOTS_SPEED`: how many times faster than real time the bots live.
+    pub bots_speed: f64,
+    /// `RMR_WEB`: where the web dashboard listens (empty: no dashboard).
+    pub web: String,
 }
 
 impl Config {
@@ -54,6 +61,15 @@ impl Config {
                 let delay = var("RMR_SOV_CLAIM_DELAY", "518400");
                 delay.parse().map_err(|_| format!("RMR_SOV_CLAIM_DELAY is not a number of seconds: {delay:?}"))?
             },
+            bots: {
+                let bots = var("RMR_BOTS", "0");
+                bots.parse().map_err(|_| format!("RMR_BOTS is not a number: {bots:?}"))?
+            },
+            bots_speed: {
+                let speed = var("RMR_BOTS_SPEED", "1");
+                speed.parse().map_err(|_| format!("RMR_BOTS_SPEED is not a number: {speed:?}"))?
+            },
+            web: var("RMR_WEB", "0.0.0.0:8080"),
         })
     }
 
@@ -89,6 +105,9 @@ mod tests {
             alliance_join_delay_secs: 0,
             starbase_speedup: 1.0,
             sov_claim_delay_secs: 0,
+            bots: 0,
+            bots_speed: 1.0,
+            web: String::new(),
         }
     }
 
