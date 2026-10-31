@@ -42,18 +42,26 @@ const BULK_WARN_BYTES: usize = 900_000;
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = logging::init() {
+    // The config says how to log, so it is read before there is a log.
+    let (config, note) = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = logging::init(&config.log_level, config.log_file.as_deref()) {
         eprintln!("{e}");
         std::process::exit(2);
     }
-    if let Err(e) = run().await {
+    info!("{note}");
+    if let Err(e) = run(config).await {
         error!("{}", logging::chain(&*e));
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::from_env()?;
+async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let table = std::fs::read(&config.strings)
         .map(|raw| StringTable::parse(&raw))
@@ -71,6 +79,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(|r| r.get(0))
         .unwrap_or(0);
     info!("database: {} ({accounts} accounts)", config.database_redacted());
+    let ids = db::sync_accounts(&client, &config.accounts)
+        .await
+        .map_err(|e| format!("setting up the config file's accounts: {}", logging::chain(&e)))?;
+    if !ids.is_empty() {
+        info!("{} account(s) from the config file", ids.len());
+    }
+    config::set_rules(config::Rules {
+        starting_isk: config.starting_isk,
+        account_isk: ids.iter().zip(&config.accounts).filter_map(|(id, a)| Some((*id, a.starting_isk?))).collect(),
+        auto_create_accounts: config.auto_create_accounts,
+    });
 
     let started = Instant::now();
     let bulk =

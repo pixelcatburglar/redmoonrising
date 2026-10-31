@@ -395,8 +395,6 @@ const POINTS_TO_ASSIGN: i32 = 5;
 const MAX_ATTRIBUTE_VALUE: i32 = 20;
 const MAX_CHARACTERS_PER_ACCOUNT: i64 = 3;
 
-const STARTING_BALANCE: f64 = 5_000.0;
-
 const FLAG_NONE: i32 = 0;
 const FLAG_CARGO: i32 = 5;
 const FLAG_SKILL: i32 = 7;
@@ -1061,7 +1059,7 @@ async fn insert_character_row(
             &req.account_id,
             &empty,
             &empty,
-            &STARTING_BALANCE,
+            &crate::config::starting_isk(req.account_id as i64),
             &empty,
             &src.corporation_id,
             &now,

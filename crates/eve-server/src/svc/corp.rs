@@ -167,10 +167,12 @@ const CORP_HEADER: &[&str] = &[
     "division3", "division4", "division5", "division6", "division7", "balance", "deleted",
 ];
 
+// NPC corporations have no founder (creatorID 0, which no owner record
+// matches); their CEO stands in, so the info window shows "CEO and Founder".
 const CORP_SQL: &str = r#"SELECT "corporationID","corporationName","description","tickerName",
                                  "url","taxRate","minimumJoinStanding","corporationType",
                                  "hasPlayerPersonnelManager","sendCharTerminationMessage",
-                                 "creatorID","ceoID","stationID","raceID","allianceID","shares",
+                                 COALESCE(NULLIF("creatorID", 0), "ceoID"),"ceoID","stationID","raceID","allianceID","shares",
                                  "memberCount","memberLimit","allowedMemberRaceIDs","graphicID",
                                  "shape1","shape2","shape3","color1","color2","color3","typeface",
                                  "division1","division2","division3","division4","division5",

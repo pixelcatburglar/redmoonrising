@@ -10,7 +10,7 @@ services:
       POSTGRES_DB: rmr
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     ports:
-      - "55432:5432"
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db:/docker-entrypoint-initdb.d:ro
@@ -29,16 +29,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Settings, accounts and bots are in rmr.yml; restart the server after
+    # editing it. The database address here wins over the file's, since the
+    # server reaches postgres by its service name.
     environment:
       RMR_DATABASE: postgres://rmr:rmr@postgres:5432/rmr
-      # Seconds before an accepted alliance application takes effect (24 h).
-      RMR_ALLIANCE_JOIN_DELAY: "86400"
-      # How many times faster than normal structures anchor, online and unanchor.
-      RMR_STARBASE_SPEEDUP: "1"
-      # Seconds a tower's claim stands before it counts toward sovereignty (6 days).
-      RMR_SOV_CLAIM_DELAY: "518400"
-      # How many bot characters the server plays (0: none). Made on the first start.
-      RMR_BOTS: "100000"
+    volumes:
+      - ./rmr.yml:/app/rmr.yml:ro
     ports:
       - "26000:26000"
       # The web dashboard: this machine only, since it has no login.

@@ -76,6 +76,9 @@ pub struct Presence {
 struct Client {
     tx: UnboundedSender<Push>,
     presence: Option<Presence>,
+    /// The system whose ballpark the client has been sent (SetState). Until
+    /// then it has no ballpark, and a destiny update would fail in michelle.
+    sees: Option<i64>,
 }
 
 struct Channel {
@@ -134,7 +137,7 @@ impl WorldState {
     /// Registers a connection; notifications for it arrive on the receiver.
     pub fn connect(&mut self, client_id: i64) -> UnboundedReceiver<Push> {
         let (tx, rx) = unbounded_channel();
-        self.clients.insert(client_id, Client { tx, presence: None });
+        self.clients.insert(client_id, Client { tx, presence: None, sees: None });
         rx
     }
 
@@ -157,7 +160,18 @@ impl WorldState {
 
     pub fn set_presence(&mut self, client_id: i64, presence: Option<Presence>) {
         if let Some(c) = self.clients.get_mut(&client_id) {
+            // Docked or gone elsewhere, its ballpark is gone with it.
+            if presence.is_none_or(|p| p.docked || Some(p.solar_system_id) != c.sees) {
+                c.sees = None;
+            }
             c.presence = presence;
+        }
+    }
+
+    /// The client has been sent the ballpark of `solar_system_id`.
+    pub fn sees(&mut self, client_id: i64, solar_system_id: i64) {
+        if let Some(c) = self.clients.get_mut(&client_id) {
+            c.sees = Some(solar_system_id);
         }
     }
 
@@ -237,12 +251,15 @@ impl WorldState {
             .collect()
     }
 
-    /// Clients whose character is in space in `solar_system_id`.
+    /// Clients whose character is in space in `solar_system_id` and that
+    /// have its ballpark: one just undocked or arrived gets what happened
+    /// meanwhile in its SetState.
     pub fn in_space(&self, solar_system_id: i64) -> Vec<i64> {
         self.clients
             .iter()
             .filter(|(_, c)| {
-                c.presence.is_some_and(|p| p.solar_system_id == solar_system_id && !p.docked)
+                c.sees == Some(solar_system_id)
+                    && c.presence.is_some_and(|p| p.solar_system_id == solar_system_id && !p.docked)
             })
             .map(|(id, _)| *id)
             .collect()
@@ -340,7 +357,15 @@ mod tests {
         w.set_presence(1, presence(140000001, true));
         w.set_presence(2, presence(140000002, false));
         assert!(w.is_online(140000001));
+        // In space, but sent no ballpark yet: no destiny updates.
+        assert!(w.in_space(30002780).is_empty());
+        w.sees(2, 30002780);
         assert_eq!(w.in_space(30002780), vec![2]);
+        // Docking takes the ballpark away.
+        w.set_presence(2, presence(140000002, true));
+        w.set_presence(2, presence(140000002, false));
+        assert!(w.in_space(30002780).is_empty());
+        w.sees(2, 30002780);
         let (space, docked) = w.counts();
         assert_eq!((space[&30002780], docked[&30002780]), (1, 1));
 

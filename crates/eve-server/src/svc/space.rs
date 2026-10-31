@@ -486,6 +486,7 @@ async fn push_set_state(ctx: &Ctx<'_>) {
     }
     debug!("SetState: {} ball(s), ego {ship_id}", park.celestials.len() + park.ships.len());
     broadcast(&world, system, Some(ctx.client_id), entries);
+    world.sees(ctx.client_id, system);
 }
 
 /// (diff, x, y, z, serverTick, tTime, rTime): where the server has the ship, and

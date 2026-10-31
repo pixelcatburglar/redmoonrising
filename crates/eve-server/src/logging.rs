@@ -1,8 +1,10 @@
 //! Log output: coloured, levelled lines on stdout, optionally mirrored to a file.
 //!
-//! - `RMR_LOG` (or `RUST_LOG`) sets the filter, e.g. `debug`, `info,eve_server::svc=trace`.
-//!   The default shows every service call (`debug`) and hides library chatter.
-//! - `RMR_LOG_FILE` also appends plain, uncoloured lines to that file.
+//! - The level comes from the config file (`log.level`), or `RMR_LOG` (or
+//!   `RUST_LOG`): `off`, `error`, `warn`, `info`, `debug` or `trace`, or a
+//!   filter of its own such as `info,eve_server::svc=trace`. `debug`, the
+//!   default, shows every service call and hides library chatter.
+//! - `log.file` (or `RMR_LOG_FILE`) also appends plain, uncoloured lines to that file.
 //! - `NO_COLOR` turns colour off; it is also off when stdout is not a terminal.
 //!
 //! Every line from a connection carries its `conn{..}` span (clientID, peer, and the
@@ -20,27 +22,38 @@ use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
-const DEFAULT_FILTER: &str = "info,eve_server=debug";
 const TIME_FORMAT: &str = "%H:%M:%S%.3f";
 
-pub fn init() -> Result<(), String> {
-    let filter = std::env::var("RMR_LOG")
-        .or_else(|_| std::env::var("RUST_LOG"))
-        .unwrap_or_else(|_| DEFAULT_FILTER.to_string());
-    let filter = EnvFilter::try_new(&filter).map_err(|e| format!("bad log filter {filter:?}: {e}"))?;
+/// The filter a level stands for. Below `info`, only the server's own lines
+/// are let through: the libraries' are noise.
+pub fn filter_for(level: &str) -> String {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" => "off".into(),
+        "error" => "error".into(),
+        "warn" | "warning" => "warn".into(),
+        "info" => "info".into(),
+        "debug" => "info,eve_server=debug".into(),
+        "trace" => "info,eve_server=trace".into(),
+        _ => level.trim().to_string(),
+    }
+}
+
+pub fn init(level: &str, file: Option<&std::path::Path>) -> Result<(), String> {
+    let filter = filter_for(level);
+    let filter = EnvFilter::try_new(&filter).map_err(|e| format!("bad log level {level:?}: {e}"))?;
 
     let console = fmt::layer()
         .with_timer(ChronoLocal::new(TIME_FORMAT.into()))
         .with_target(false)
         .with_ansi(use_colour());
 
-    let file = match std::env::var("RMR_LOG_FILE") {
-        Ok(path) => {
+    let file = match file {
+        Some(path) => {
             let f = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&path)
-                .map_err(|e| format!("cannot open RMR_LOG_FILE {path}: {e}"))?;
+                .open(path)
+                .map_err(|e| format!("cannot open the log file {}: {e}", path.display()))?;
             Some(
                 fmt::layer()
                     .with_timer(ChronoLocal::new(format!("%Y-%m-%d {TIME_FORMAT}")))
@@ -50,7 +63,7 @@ pub fn init() -> Result<(), String> {
                     .with_writer(Mutex::new(f)),
             )
         }
-        Err(_) => None,
+        None => None,
     };
 
     tracing_subscriber::registry()

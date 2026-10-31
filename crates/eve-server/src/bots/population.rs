@@ -225,7 +225,7 @@ pub async fn ensure(db: &mut Client, atlas: &Atlas, target: usize) -> Result<usi
         .query_one(
             r#"WITH found AS (SELECT "accountID" FROM "account" WHERE "accountName" = $1),
                     made AS (INSERT INTO "account" ("accountID", "accountName", "password", "role", "banned")
-                             SELECT (SELECT COALESCE(max("accountID"), 0) + 1 FROM "account"), $1, '', 0, 1
+                             SELECT nextval('"account_accountID_seq"'), $1, '', 0, 1
                               WHERE NOT EXISTS (SELECT 1 FROM found) RETURNING "accountID")
                SELECT "accountID" FROM found UNION ALL SELECT "accountID" FROM made"#,
             &[&BOT_ACCOUNT],

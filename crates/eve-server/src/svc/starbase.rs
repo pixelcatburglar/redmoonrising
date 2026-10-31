@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use eve_marshal::Value;
 use tokio_postgres::{Client, GenericClient};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::ballpark::Vec3;
 use crate::items::{self, ItemTxn, NewItem};
@@ -951,21 +951,38 @@ pub async fn sovereignty(db: &Client, claim_delay_secs: i64) {
     let mut systems: Vec<i64> = by_system.keys().chain(holders.keys()).copied().collect();
     systems.sort_unstable();
     systems.dedup();
-    for system in systems {
-        let holder = holders.get(&system).copied();
-        let winner = sovereign(by_system.get(&system).map_or(&[][..], |v| v), holder);
-        if winner == holder {
-            continue;
-        }
+    let changes: Vec<(i64, Option<i64>, Option<i64>)> = systems
+        .into_iter()
+        .filter_map(|system| {
+            let holder = holders.get(&system).copied();
+            let winner = sovereign(by_system.get(&system).map_or(&[][..], |v| v), holder);
+            (winner != holder).then_some((system, holder, winner))
+        })
+        .collect();
+    // Many at once (null-sec settled at the start) are summed up, not listed.
+    let many = changes.len() > SOV_CHANGES_LISTED;
+    let mut moved = 0;
+    for (system, holder, winner) in &changes {
         let saved = db
-            .execute(r#"UPDATE "mapSolarSystems" SET "allianceID" = $2 WHERE "solarSystemID" = $1"#, &[&(system as i32), &winner.map(|a| a as i32)])
+            .execute(r#"UPDATE "mapSolarSystems" SET "allianceID" = $2 WHERE "solarSystemID" = $1"#, &[&(*system as i32), &winner.map(|a| a as i32)])
             .await;
         match saved {
+            Ok(_) if many => debug!("sovereignty of {system} passes from {holder:?} to {winner:?}"),
             Ok(_) => info!("sovereignty of {system} passes from {holder:?} to {winner:?}"),
-            Err(e) => error!("moving sovereignty of {system}: {}", crate::logging::chain(&e)),
+            Err(e) => {
+                error!("moving sovereignty of {system}: {}", crate::logging::chain(&e));
+                continue;
+            }
         }
+        moved += 1;
+    }
+    if many {
+        info!("sovereignty of {moved} systems changed hands");
     }
 }
+
+/// More changes of sovereignty than this in one pass are logged as a count.
+const SOV_CHANGES_LISTED: usize = 10;
 
 /// The alliance with strictly the most claims; on a tie the holder keeps it
 /// if it is among the leaders, else nobody holds it.

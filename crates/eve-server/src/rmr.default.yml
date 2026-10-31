@@ -1,0 +1,60 @@
+# RMR server settings. Restart the server after changing this file.
+# Anything left out takes the default shown here. An RMR_* environment
+# variable, where one is named, overrides the setting.
+
+server:
+  # Where the game client connects (RMR_BIND).
+  bind: 0.0.0.0:26000
+  # The web dashboard; empty turns it off (RMR_WEB). It has no login, so
+  # keep it off the open internet.
+  web: 0.0.0.0:8080
+  # The PostgreSQL database (RMR_DATABASE).
+  database: postgres://rmr:rmr@127.0.0.1:55432/rmr
+  # This node's machoNet ID (RMR_NODE_ID); leave it at 1.
+  nodeId: 1
+  # Logging in with an unknown username makes that account, with the
+  # password given (RMR_AUTO_CREATE_ACCOUNTS).
+  autoCreateAccounts: false
+  # Where frames the server cannot decode are saved (RMR_DUMP_DIR).
+  dumpDir: .
+
+log:
+  # off, error, warn, info, debug or trace (RMR_LOG). debug shows every
+  # service call; info only what matters; trace everything. A filter such
+  # as "info,eve_server::svc=trace" works too.
+  level: debug
+  # A file that also gets every line; empty for none (RMR_LOG_FILE).
+  file: ""
+
+game:
+  # ISK a new character starts with (RMR_STARTING_ISK).
+  startingIsk: 5000
+  # Seconds from an alliance accepting a corporation to it joining; the
+  # client says 24 hours (RMR_ALLIANCE_JOIN_DELAY).
+  allianceJoinDelaySeconds: 86400
+  # How many times faster than normal structures anchor, online and
+  # unanchor (RMR_STARBASE_SPEEDUP).
+  starbaseSpeedup: 1
+  # Seconds a control tower's claim stands before it counts toward
+  # sovereignty; the client says up to six days (RMR_SOV_CLAIM_DELAY).
+  sovClaimDelaySeconds: 518400
+
+bots:
+  # How many bot characters the server plays; 0 for none (RMR_BOTS).
+  # They are made on the first start with bots and kept after.
+  count: 0
+  # How many times faster than real time they live (RMR_BOTS_SPEED).
+  speed: 1
+
+# Accounts made, or brought into line with this file, at every start.
+# Accounts not listed here are left as they are; removing one from the
+# list does not delete it.
+#   gm:          GM powers (slash commands, petitions).
+#   banned:      cannot log in.
+#   startingIsk: what this account's new characters start with, instead
+#                of game.startingIsk.
+#   role:        extra role bits, for those who know the client's roles.
+accounts:
+  - username: testuser
+    password: testpass
+    gm: false
