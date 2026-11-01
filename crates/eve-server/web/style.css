@@ -218,6 +218,50 @@ tbody tr:hover { background: var(--row-hover); }
 .bot { color: var(--faint); font-size: 10px; }
 #news td:last-child { white-space: normal; }
 
+/* ---- forms, notes and histories -------------------------------------------- */
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 6px 4px;
+}
+
+.note { margin: 6px 8px; color: var(--dim); }
+
+input, select, button {
+  font: inherit;
+  color: var(--text);
+  background: rgba(0, 0, 0, .45);
+  border: 1px solid rgba(255, 255, 255, .18);
+  padding: 2px 5px;
+  min-height: 19px;
+}
+
+input { min-width: 0; flex: 0 1 140px; }
+input[type="number"] { flex-basis: 60px; }
+button { cursor: pointer; background: linear-gradient(180deg, #3a3e45, #24272d); }
+button:hover { color: var(--highlight); border-color: rgba(255, 255, 255, .4); }
+button:disabled { color: var(--faint); cursor: default; }
+input:focus, select:focus, button:focus-visible { outline: 1px solid rgba(255, 255, 255, .5); }
+
+.pick { padding: 1px 6px; }
+
+.history {
+  margin: 4px 8px 8px;
+  padding-left: 18px;
+  color: var(--dim);
+  max-height: 160px;
+  overflow: auto;
+}
+
+.history li { padding: 1px 0; }
+.history time { color: var(--faint); margin-right: 6px; }
+
+tr.chosen { background: rgba(255, 255, 255, .1) !important; }
+td.wrap { white-space: normal; }
+
 @media (max-width: 560px) {
   .neocom { display: none; }
   .desktop { margin-left: 0; padding: 8px; }

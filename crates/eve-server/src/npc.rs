@@ -514,6 +514,7 @@ struct Seen {
     player: bool,
     /// Its side in a war: its alliance, or its corporation outside one.
     side: i64,
+    char_id: i64,
 }
 
 pub fn think(park: &mut Park, now: i64, out: &mut Out) {
@@ -521,7 +522,7 @@ pub fn think(park: &mut Park, now: i64, out: &mut Out) {
         .ships
         .values()
         .filter(|s| s.is_pilot() && !s.warping())
-        .map(|s| Seen { id: s.id, pos: s.pos, player: s.is_player(), side: crate::svc::war::side(&s.pilot) })
+        .map(|s| Seen { id: s.id, pos: s.pos, player: s.is_player(), side: crate::svc::war::side(&s.pilot), char_id: s.pilot.char_id })
         .collect();
     let players: Vec<(i64, Vec3)> = seen.iter().filter(|s| s.player).map(|s| (s.id, s.pos)).collect();
     spawn_where_needed(park, now, &players, out);
@@ -912,9 +913,20 @@ const MISSILE_CLOUD_MULTIPLIER: i32 = 858;
 const MISSILE_AOE_VELOCITY_MULTIPLIER: i32 = 859;
 
 fn think_one(park: &mut Park, id: i64, now: i64, seen: &[Seen], enemies: &HashSet<(i64, i64)>, out: &mut Out) {
+    // A bot may be fighting a rat (a wingman's): where that rat is.
+    let rat_target = park
+        .ships
+        .get(&id)
+        .filter(|s| s.bot)
+        .and_then(|s| s.npc.as_ref()?.target)
+        .and_then(|t| park.ships.get(&t))
+        .filter(|t| t.is_npc())
+        .map(|t| t.pos);
     let Some(rat) = park.ships.get_mut(&id) else { return };
-    // A bot also fights its war's enemies, wherever they come from.
+    // A bot also fights its war's enemies, wherever they come from, and
+    // players its side holds to be hostile; and leaves its friends alone.
     let (is_bot, my_side) = (rat.bot, crate::svc::war::side(&rat.pilot));
+    let me = if is_bot { Some(rat.pilot.clone()) } else { None };
     let (Some(brain), Some(fight)) = (rat.npc.as_mut(), rat.fight.as_mut()) else { return };
     brain.next_think_ms = now + THINK_MS;
 
@@ -946,7 +958,8 @@ fn think_one(park: &mut Park, id: i64, now: i64, seen: &[Seen], enemies: &HashSe
         let keep = seen
             .iter()
             .find(|s| s.id == t && (s.player || is_bot))
-            .is_some_and(|s| (s.pos - pos).len() <= leash && (s.pos - belt_pos).len() <= LEASH * 1.5);
+            .is_some_and(|s| (s.pos - pos).len() <= leash && (s.pos - belt_pos).len() <= LEASH * 1.5)
+            || rat_target.is_some_and(|p| (p - pos).len() <= leash.max(WAR_AGGRO_RANGE * 2.0));
         if !keep {
             disengage(park, id, now, out);
             return;
@@ -963,8 +976,16 @@ fn think_one(park: &mut Park, id: i64, now: i64, seen: &[Seen], enemies: &HashSe
                 .iter()
                 .filter(|s| s.id != id)
                 .filter_map(|s| {
+                    let stance = match (&me, s.player) {
+                        (Some(me), true) => crate::bots::stance(me, s.char_id),
+                        _ => crate::bots::Stance::Neutral,
+                    };
                     let reach = if is_bot && enemies.contains(&(my_side, s.side)) {
                         WAR_AGGRO_RANGE.max(aggro)
+                    } else if s.player && stance == crate::bots::Stance::Hostile {
+                        WAR_AGGRO_RANGE.max(aggro)
+                    } else if s.player && stance == crate::bots::Stance::Friendly {
+                        return None;
                     } else if s.player {
                         aggro
                     } else {

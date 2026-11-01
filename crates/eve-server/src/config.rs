@@ -39,6 +39,12 @@ pub struct Config {
     pub bots_speed: f64,
     /// `RMR_BOTS_SHOWN`: the most bot ships shown in one system at once.
     pub bots_shown: usize,
+    /// `RMR_BOTS_PIRATES_ATTACK`: whether bot pirates attack players on
+    /// sight outside high-sec (those a player has angered do anyway).
+    pub bots_pirates_attack: bool,
+    /// `RMR_BOTS_CONTROLS`: whether the web dashboard may steer the bots
+    /// (start events and wars, set region density).
+    pub bots_controls: bool,
     /// `RMR_WEB`: where the web dashboard listens (empty: no dashboard).
     pub web: String,
     /// `RMR_STARTING_ISK`: what a new character starts with.
@@ -138,6 +144,8 @@ struct BotsSection {
     count: usize,
     speed: f64,
     shown_per_system: usize,
+    pirates_attack_players: bool,
+    dashboard_controls: bool,
 }
 
 impl Default for ServerSection {
@@ -162,7 +170,7 @@ impl Default for GameSection {
 
 impl Default for BotsSection {
     fn default() -> Self {
-        BotsSection { count: 0, speed: 1.0, shown_per_system: 120 }
+        BotsSection { count: 0, speed: 1.0, shown_per_system: 120, pirates_attack_players: true, dashboard_controls: false }
     }
 }
 
@@ -185,6 +193,8 @@ impl Config {
             bots: file.bots.count,
             bots_speed: file.bots.speed,
             bots_shown: file.bots.shown_per_system,
+            bots_pirates_attack: file.bots.pirates_attack_players,
+            bots_controls: file.bots.dashboard_controls,
             web: file.server.web,
             starting_isk: file.game.starting_isk,
             auto_create_accounts: file.server.auto_create_accounts,
@@ -220,6 +230,8 @@ impl Config {
         number("RMR_BOTS", &mut c.bots)?;
         number("RMR_BOTS_SPEED", &mut c.bots_speed)?;
         number("RMR_BOTS_SHOWN", &mut c.bots_shown)?;
+        number("RMR_BOTS_PIRATES_ATTACK", &mut c.bots_pirates_attack)?;
+        number("RMR_BOTS_CONTROLS", &mut c.bots_controls)?;
         number("RMR_STARTING_ISK", &mut c.starting_isk)?;
         number("RMR_AUTO_CREATE_ACCOUNTS", &mut c.auto_create_accounts)?;
         if !(0..10_000_000).contains(&c.node_id) {
@@ -335,6 +347,8 @@ mod tests {
             bots: 0,
             bots_speed: 1.0,
             bots_shown: 120,
+            bots_pirates_attack: true,
+            bots_controls: false,
             web: String::new(),
             starting_isk: 0.0,
             auto_create_accounts: false,

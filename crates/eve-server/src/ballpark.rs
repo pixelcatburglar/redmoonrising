@@ -237,6 +237,9 @@ pub struct Ship {
     pub arrived_through: Option<i64>,
     /// Flown by the bot simulation: a pilot like a player's, with no client.
     pub bot: bool,
+    /// A bot ship's fitting and cargo, (type, quantity): what its wreck holds
+    /// and its killmail lists.
+    pub bot_loot: Vec<(i64, i64)>,
 }
 
 impl Ship {
@@ -260,6 +263,7 @@ impl Ship {
             harmonic: crate::destiny::NO_HARMONIC,
             arrived_through: None,
             bot: false,
+            bot_loot: Vec::new(),
         }
     }
 
@@ -314,10 +318,9 @@ pub struct Park {
     pub structures: BTreeMap<i64, crate::pos::Structure>,
     /// Agents' mission sites, by beacon ID.
     pub sites: BTreeMap<i64, crate::sites::Site>,
-    /// Bots whose ships were destroyed here, by character, with the capsule
-    /// each ejected in (None: it was the capsule), for the bot simulation to
+    /// Bots whose ships were destroyed here, for the bot simulation to
     /// collect.
-    pub bot_losses: Vec<(i64, Option<i64>)>,
+    pub bot_losses: Vec<BotLoss>,
     /// Starbases under attack since the bots last looked: (tower, the
     /// attacking ship), for their owners to answer.
     pub tower_alarms: Vec<(i64, i64)>,
@@ -329,6 +332,18 @@ pub struct Park {
     /// What lives in this system's belts.
     pub wildlife: Arc<Wildlife>,
     pub rng: Rng,
+}
+
+/// A bot ship or capsule destroyed in space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BotLoss {
+    pub char_id: i64,
+    /// The capsule its pilot ejected in; None when it was the capsule.
+    pub pod: Option<i64>,
+    /// The character who landed the final blow; 0 for none (or an NPC).
+    pub killer: i64,
+    /// What was lost.
+    pub type_id: i64,
 }
 
 impl Park {

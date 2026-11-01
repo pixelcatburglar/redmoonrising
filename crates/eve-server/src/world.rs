@@ -106,6 +106,22 @@ pub struct WorldState {
     /// The online bots in each solar system, docked or not, as indexes into
     /// `bot_roster`: who is in Local there.
     pub bot_local: HashMap<i64, Vec<u32>>,
+    /// Every bot's character, to its index in the bot population.
+    pub bot_index: HashMap<i64, u32>,
+    /// Offers to hire a bot (gang invitations to one): (player, bot), for
+    /// the simulation to answer.
+    pub hire_requests: Vec<(i64, i64)>,
+    /// What the dashboard shows of the bots beyond `bot_stats`, as JSON.
+    pub bot_panels: BotPanels,
+}
+
+/// The bot simulation's dashboard windows, ready to send.
+#[derive(Debug, Clone, Default)]
+pub struct BotPanels {
+    pub market: serde_json::Value,
+    pub relations: serde_json::Value,
+    pub followed: serde_json::Value,
+    pub events: serde_json::Value,
 }
 
 /// A siege as the dashboard shows it.

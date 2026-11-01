@@ -61,6 +61,8 @@ pub struct Loss {
     /// Who landed the final blow, as in [`Attacker::who`].
     pub final_blow: Option<i64>,
     pub attackers: Vec<Attacker>,
+    /// For a bot: the fittings and cargo destroyed with it, (type, quantity).
+    pub items: Vec<(i64, i64)>,
 }
 
 impl Loss {
@@ -85,6 +87,7 @@ impl Loss {
             capsule,
             final_blow,
             attackers,
+            items: Vec::new(),
         }
     }
 }
@@ -99,7 +102,12 @@ pub async fn handle(server: &Server, db: &mut Client, loss: Loss) {
 /// The rest (a new ship, waking at home) is the bot simulation's.
 pub async fn bot_lost(server: &Server, db: &mut Client, loss: Loss) {
     let report = report_text(db, &loss).await;
-    record(server, db, &loss, report, Vec::new()).await;
+    let mut destroyed = Vec::new();
+    for (t, n) in &loss.items {
+        let name = type_name(&*db, *t).await;
+        destroyed.push(if *n > 1 { format!("{name}, Qty: {n}") } else { name });
+    }
+    record(server, db, &loss, report, destroyed).await;
 }
 
 // ---- the ship -----------------------------------------------------------------------------
@@ -519,14 +527,12 @@ async fn record(server: &Server, db: &mut Client, loss: &Loss, mut text: String,
     let subject = format!("Kill: {} ({ship_name})", victim.name);
     let result = async {
         let tx = db.transaction().await?;
-        let kill_id: i64 = tx.query_one(r#"SELECT COALESCE(MAX("killID"), 0) + 1 FROM "killLog""#, &[]).await?.get(0);
         let final_char = loss.final_blow.filter(|w| *w > 0).unwrap_or(0);
-        tx.execute(
-            r#"INSERT INTO "killLog" ("killID","killTime","victimCharID","victimCorpID","victimAllianceID","victimShipTypeID",
+        let kill_id: i64 = tx.query_one(
+            r#"INSERT INTO "killLog" ("killTime","victimCharID","victimCorpID","victimAllianceID","victimShipTypeID",
                                       "victimItemID","solarSystemID","locationID","finalBlowID","totalDamage","isPodKill")
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10,$11)"#,
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10) RETURNING "killID""#,
             &[
-                &kill_id,
                 &crate::bulkdata::filetime_now(),
                 &(loss.char_id as i32),
                 &(victim.corp_id as i32),
@@ -539,7 +545,8 @@ async fn record(server: &Server, db: &mut Client, loss: &Loss, mut text: String,
                 &i16::from(loss.capsule),
             ],
         )
-        .await?;
+        .await?
+        .get(0);
         for a in loss.attackers.iter().filter(|a| a.who > 0) {
             let p = who(&tx, a.who).await;
             tx.execute(

@@ -88,6 +88,68 @@ interface Kill {
   pod: boolean;
 }
 
+interface Killboard {
+  total: number;
+  sides: { name: string; ticker: string; kills: number; losses: number; bots: boolean }[];
+  ships: { ship: string; lost: number }[];
+}
+
+interface MarketLine {
+  name: string;
+  kind: string;
+  stock: number;
+  ask: number;
+  bid: number;
+  npcAsk: number;
+}
+
+interface Market {
+  minedM3: number;
+  refinedUnits: number;
+  hauledM3: number;
+  hullsBuilt: number;
+  hullsBought: number;
+  hullsFromNpcs: number;
+  soldToPlayers: number;
+  boughtFromPlayers: number;
+  playerOrdersFilled: number;
+  orders: number;
+  corpTax: number;
+  hubs: { station: string; worth: number; goods: MarketLine[] }[];
+  shortages: { name: string; wanted: number }[];
+}
+
+interface Relations {
+  standings: { side: string; player: string; heat: number; favor: number; flags: string[] }[];
+  wingmen: { bot: string; player: string; rate: number }[];
+  hunting: number;
+  grudges: number;
+}
+
+interface Followed {
+  id: number;
+  name: string;
+  role: string;
+  corporation: string;
+  alliance: string | null;
+  ship: string;
+  tier: number;
+  isk: number;
+  online: boolean;
+  activity: string;
+  system: string;
+  security: number;
+  station: string | null;
+  history: NewsItem[];
+}
+
+interface Events {
+  raids: { system: string; raiders: number; kills: number; lost: number }[];
+  log: NewsItem[];
+  said: NewsItem[];
+  controls: boolean;
+}
+
 /// One column of a list: its heading, what it sorts by, and its cell.
 interface Column<T> {
   title: string;
@@ -214,6 +276,10 @@ function draw(id: string): void {
 
 const count = (n: number) => [numbers.format(n)];
 
+const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+const isk = (n: number) => `${compact.format(n)} ISK`;
+const price = (n: number) => (n >= 1000 ? compact.format(n) : n.toFixed(2));
+
 // ---- windows ----------------------------------------------------------------------
 
 function showStatus(s: Summary): void {
@@ -331,11 +397,227 @@ async function refresh(): Promise<void> {
       { title: "System", key: (k) => k.system ?? "", cell: (k) => [k.system ?? ""] },
       { title: "Final blow", key: (k) => k.finalBlow ?? "", cell: (k) => [k.finalBlow ?? ""] },
     ], kills, "No kills have been reported.", 0, true);
+    await refreshBots();
   } catch (e) {
     const line = document.getElementById("statusline") as HTMLElement;
     line.textContent = `Status: unreachable, retrying (${e instanceof Error ? e.message : String(e)})`;
   }
 }
+
+// ---- the bots' windows -------------------------------------------------------------
+
+let market: Market | null = null;
+let chosenPilot: number | null = null;
+let followedNow: Followed[] = [];
+
+async function refreshBots(): Promise<void> {
+  const [board, mkt, rel, followed, events] = await Promise.all([
+    get<Killboard>("/api/killboard"),
+    get<Market | null>("/api/market"),
+    get<Relations | null>("/api/relations"),
+    get<Followed[] | null>("/api/followed"),
+    get<Events | null>("/api/events"),
+  ]);
+
+  setText("killboard-total", `${numbers.format(board.total)} ships destroyed in the last day`);
+  list("killboard", [
+    { title: "Alliance / corporation", key: (k) => k.name, cell: (k) => [k.name, allianceTicker(k.ticker), k.bots ? "" : span(" (players)", "dim")] },
+    { title: "Kills", num: true, key: (k) => k.kills, cell: (k) => count(k.kills) },
+    { title: "Losses", num: true, key: (k) => k.losses, cell: (k) => count(k.losses) },
+  ], board.sides, "Nothing has died today.", 1, true);
+  list("killboard-ships", [
+    { title: "Hull", key: (s) => s.ship, cell: (s) => [s.ship] },
+    { title: "Lost", num: true, key: (s) => s.lost, cell: (s) => count(s.lost) },
+  ], board.ships, "", 1, true);
+
+  if (mkt && mkt.hubs) {
+    market = mkt;
+    const select = document.getElementById("hub") as HTMLSelectElement;
+    const before = select.value;
+    if (select.options.length !== mkt.hubs.length) {
+      select.replaceChildren(...mkt.hubs.map((h) => new Option(h.station, h.station)));
+      select.value = before || (mkt.hubs[0]?.station ?? "");
+    }
+    showMarket();
+    setText(
+      "market-summary",
+      `${compact.format(mkt.minedM3)} m3 mined, ${compact.format(mkt.hauledM3)} m3 hauled, ${numbers.format(mkt.hullsBuilt)} hulls built, ` +
+        `${numbers.format(mkt.hullsBought)} bought (${numbers.format(mkt.hullsFromNpcs)} from NPCs); players bought ${isk(mkt.soldToPlayers)} and sold ${isk(mkt.boughtFromPlayers)}; ` +
+        `${numbers.format(mkt.orders)} orders up; ${isk(mkt.corpTax)} in corporation tax`,
+    );
+    setText("market-shortages", mkt.shortages.length ? `Short of: ${mkt.shortages.map((s) => `${s.name} (${s.wanted})`).join(", ")}` : "");
+  }
+
+  if (rel && rel.standings) {
+    setText("relations-summary", `${numbers.format(rel.grudges)} pilots hold a grudge; ${numbers.format(rel.hunting)} are out hunting`);
+    list("relations", [
+      { title: "Side", key: (r) => r.side, cell: (r) => [r.side] },
+      { title: "Player", key: (r) => r.player, cell: (r) => [r.player] },
+      { title: "Heat", num: true, key: (r) => r.heat, cell: (r) => [r.heat ? span(r.heat.toFixed(1), "hostile") : ""] },
+      { title: "Favor", num: true, key: (r) => r.favor, cell: (r) => [r.favor ? r.favor.toFixed(1) : ""] },
+      { title: "", key: (r) => r.flags.join(), cell: (r) => [span(r.flags.join(", "), r.flags.includes("hostile") ? "hostile" : "dim")] },
+    ], rel.standings, "No bot side has an opinion of any player yet.", 2, true);
+    list("wingmen", [
+      { title: "Wingman", key: (w) => w.bot, cell: (w) => [w.bot] },
+      { title: "Flies with", key: (w) => w.player, cell: (w) => [w.player] },
+      { title: "Rate", num: true, key: (w) => w.rate, cell: (w) => [`${isk(w.rate)}/h`] },
+    ], rel.wingmen, "Nobody has hired a wingman.");
+  }
+
+  if (followed) {
+    followedNow = followed;
+    if (chosenPilot === null || !followed.some((f) => f.id === chosenPilot)) {
+      chosenPilot = followed[0]?.id ?? null;
+    }
+    showFollowed();
+  }
+
+  if (events) {
+    const state = events.controls ? "Controls are on." : "Controls are off: set bots.dashboardControls in rmr.yml to use them.";
+    setText("controls-state", state);
+    for (const b of document.querySelectorAll<HTMLButtonElement>("#w-control button")) {
+      b.disabled = !events.controls;
+    }
+    list("raids", [
+      { title: "Raid on", key: (r) => r.system, cell: (r) => [span(r.system, "hostile")] },
+      { title: "Raiders", num: true, key: (r) => r.raiders, cell: (r) => count(r.raiders) },
+      { title: "Kills", num: true, key: (r) => r.kills, cell: (r) => count(r.kills) },
+      { title: "Lost", num: true, key: (r) => r.lost, cell: (r) => count(r.lost) },
+    ], events.raids, "No raids under way.");
+    list("events", [
+      { title: "Time", key: (n) => n.time, cell: (n) => [eveTime(n.time)] },
+      { title: "What happened", key: (n) => n.text, cell: (n) => [n.text] },
+    ], [...events.said, ...events.log], "No upheavals yet.", 0, true);
+  }
+}
+
+function setText(id: string, text: string): void {
+  const e = document.getElementById(id);
+  if (e) {
+    e.textContent = text;
+  }
+}
+
+function showMarket(): void {
+  if (!market) {
+    return;
+  }
+  const chosen = (document.getElementById("hub") as HTMLSelectElement).value;
+  const hub = market.hubs.find((h) => h.station === chosen) ?? market.hubs[0];
+  list<MarketLine>("market", [
+    { title: "Item", key: (g) => g.name, cell: (g) => [g.name] },
+    { title: "Kind", key: (g) => g.kind, cell: (g) => [span(g.kind, "dim")] },
+    { title: "In stock", num: true, key: (g) => g.stock, cell: (g) => count(g.stock) },
+    { title: "Bots sell at", num: true, key: (g) => g.ask, cell: (g) => [price(g.ask)] },
+    { title: "Bots buy at", num: true, key: (g) => (g.kind === "ship" ? 0 : g.bid), cell: (g) => [g.kind === "ship" ? "" : price(g.bid)] },
+    { title: "NPC ask", num: true, key: (g) => g.npcAsk, cell: (g) => [span(price(g.npcAsk), "dim")] },
+  ], hub ? hub.goods : [], "The bots hold nothing here yet.", 2, true);
+}
+
+function showFollowed(): void {
+  list<Followed>("followed", [
+    { title: "Pilot", key: (f) => f.name, cell: (f) => [pilotButton(f), span(` ${f.role}`, "dim")] },
+    { title: "Corporation", key: (f) => f.corporation, cell: (f) => [f.corporation, f.alliance ? span(` ${f.alliance}`, "dim") : ""] },
+    { title: "Ship", key: (f) => f.ship, cell: (f) => [f.ship, span(` T${f.tier}`, "dim")] },
+    { title: "Where", key: (f) => f.system, cell: (f) => [security(f.security), ` ${f.system}`, f.station ? span(" (docked)", "dim") : ""] },
+    { title: "Doing", key: (f) => f.activity, cell: (f) => [f.online ? f.activity : span("offline", "dim")] },
+    { title: "Wallet", num: true, key: (f) => f.isk, cell: (f) => [isk(f.isk)] },
+    { title: "", key: () => "", cell: (f) => [unfollowButton(f)] },
+  ], followedNow, "Nobody followed. Search for a pilot's name above.");
+  const chosen = followedNow.find((f) => f.id === chosenPilot);
+  const ol = document.getElementById("history") as HTMLOListElement;
+  ol.replaceChildren(
+    ...(chosen?.history ?? []).map((h) => {
+      const li = document.createElement("li");
+      const t = document.createElement("time");
+      t.textContent = eveTime(h.time);
+      li.append(t, h.text);
+      return li;
+    }),
+  );
+}
+
+function pilotButton(f: Followed): HTMLElement {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "pick";
+  b.textContent = f.name;
+  b.addEventListener("click", () => {
+    chosenPilot = f.id;
+    showFollowed();
+  });
+  return b;
+}
+
+function unfollowButton(f: Followed): HTMLElement {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "pick";
+  b.textContent = "Stop";
+  b.title = "Stop following";
+  b.addEventListener("click", () => void control(`unfollow ${f.id}`));
+  return b;
+}
+
+async function control(what: string): Promise<void> {
+  const reply = document.getElementById("control-reply") as HTMLElement;
+  try {
+    const response = await fetch(`/api/control?do=${encodeURIComponent(what)}`, { method: "POST" });
+    const body = (await response.json()) as { ok?: string; error?: string };
+    reply.textContent = body.ok ?? body.error ?? "";
+    reply.className = body.ok ? "note" : "note hostile";
+  } catch (e) {
+    reply.textContent = `The server did not answer (${e instanceof Error ? e.message : String(e)})`;
+    reply.className = "note hostile";
+  }
+  setTimeout(() => void refresh(), 1_500);
+}
+
+let searchTimer: number | undefined;
+
+function searchPilots(): void {
+  const q = (document.getElementById("pilot-search") as HTMLInputElement).value.trim();
+  const out = document.getElementById("pilot-results") as HTMLElement;
+  if (q.length < 2) {
+    out.replaceChildren();
+    return;
+  }
+  void get<{ id: number; name: string }[]>(`/api/pilots?q=${encodeURIComponent(q)}`).then((found) => {
+    out.replaceChildren(
+      ...found.map((p) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "pick";
+        b.textContent = p.name;
+        b.title = "Follow";
+        b.addEventListener("click", () => {
+          chosenPilot = p.id;
+          void control(`follow ${p.id}`);
+        });
+        return b;
+      }),
+    );
+  });
+}
+
+(document.getElementById("hub") as HTMLSelectElement).addEventListener("change", showMarket);
+(document.getElementById("pilot-search") as HTMLInputElement).addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = window.setTimeout(searchPilots, 250);
+});
+for (const b of document.querySelectorAll<HTMLButtonElement>("#event-buttons button")) {
+  b.addEventListener("click", () => void control(b.dataset.do ?? ""));
+}
+(document.getElementById("war-form") as HTMLFormElement).addEventListener("submit", (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target as HTMLFormElement);
+  void control(`war ${f.get("a")} | ${f.get("b")}`);
+});
+(document.getElementById("density-form") as HTMLFormElement).addEventListener("submit", (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target as HTMLFormElement);
+  void control(`density ${f.get("region")} ${f.get("factor")}`);
+});
 
 // ---- the neocom clock and the minimize buttons ------------------------------------
 

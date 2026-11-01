@@ -693,16 +693,27 @@ fn deaths(park: &mut Park, now: i64, out: &mut Out) {
             info!("bot {}'s {} {id} destroyed by {}", ship.pilot.name, if capsule { "capsule" } else { "ship" }, culprit(park, killer));
             crate::concord::killed(park, &ship, capsule, out);
             let pod = if capsule { None } else { crate::bots::eject(park, &ship, now, out) };
-            park.bot_losses.push((ship.pilot.char_id, pod));
-            out.jobs.push(Job::BotLost(Box::new(crate::losses::Loss::of(&ship, system, capsule))));
-            // What survived of its fittings and cargo, for whoever killed it.
-            if let Some((char_id, _)) = killer.filter(|(c, _)| *c != 0 && !capsule) {
-                let worth = (ship.stats.mass / 1.0e6 * BOT_LOOT_PER_TONNE).clamp(10_000.0, 1_000_000.0);
-                let stash = crate::loot::roll(worth, (1, 3), &mut park.rng);
-                if !stash.is_empty() {
-                    out.jobs.push(Job::Loot { system, pos: ship.pos, owner_id: char_id, stash });
+            let killer_char = killer.map_or(0, |(c, _)| c.max(0));
+            park.bot_losses.push(crate::ballpark::BotLoss { char_id: ship.pilot.char_id, pod, killer: killer_char, type_id: ship.pilot.type_id });
+            let mut loss = crate::losses::Loss::of(&ship, system, capsule);
+            if !capsule {
+                // About half of its fittings and cargo survive, for whoever
+                // killed it; the rest is on the killmail.
+                let (kept, gone) = split_loot(&ship.bot_loot, &mut park.rng);
+                loss.items = gone;
+                if let Some((char_id, _)) = killer.filter(|(c, _)| *c != 0) {
+                    let stash = if ship.bot_loot.is_empty() {
+                        let worth = (ship.stats.mass / 1.0e6 * BOT_LOOT_PER_TONNE).clamp(10_000.0, 1_000_000.0);
+                        crate::loot::roll(worth, (1, 3), &mut park.rng)
+                    } else {
+                        kept.into_iter().map(|(type_id, quantity)| crate::loot::Stash::New { type_id, quantity }).collect()
+                    };
+                    if !stash.is_empty() {
+                        out.jobs.push(Job::Loot { system, pos: ship.pos, owner_id: char_id, stash });
+                    }
                 }
             }
+            out.jobs.push(Job::BotLost(Box::new(loss)));
         } else if ship.npc.is_some() {
             npc::killed(park, &ship, now, out);
             let bounty = ship.npc.as_ref().map_or(0.0, |b| b.bounty);
@@ -734,6 +745,22 @@ fn deaths(park: &mut Park, now: i64, out: &mut Out) {
             out.jobs.push(Job::Lost(Box::new(crate::losses::Loss::of(&ship, system, capsule))));
         }
     }
+}
+
+/// A bot's fittings and cargo split between what survives (first) and what
+/// is destroyed: each module, and about half of each stack, by chance.
+fn split_loot(loot: &[(i64, i64)], rng: &mut crate::combat::Rng) -> (Vec<(i64, i64)>, Vec<(i64, i64)>) {
+    let (mut kept, mut gone) = (Vec::new(), Vec::new());
+    for &(t, n) in loot {
+        let k = if n <= 8 { (0..n).filter(|_| rng.unit() < 0.5).count() as i64 } else { ((n as f64) * rng.range(0.3, 0.7)).round() as i64 };
+        if k > 0 {
+            kept.push((t, k));
+        }
+        if n - k > 0 {
+            gone.push((t, n - k));
+        }
+    }
+    (kept, gone)
 }
 
 /// Starbase structures shot to pieces: they go, with what they held; a tower

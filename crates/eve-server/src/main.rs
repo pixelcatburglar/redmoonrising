@@ -116,6 +116,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     });
     pos::set_speedup(config.starbase_speedup);
     tokio::spawn(heartbeat::run(Arc::clone(&server)));
+    bots::configure(config.bots_pirates_attack, config.bots_controls);
     tokio::spawn(bots::run(Arc::clone(&server), config.bots, config.bots_speed, config.bots_shown));
     tokio::spawn(web::run(Arc::clone(&server), config.web.clone()));
     let listener = TcpListener::bind(&config.bind).await?;

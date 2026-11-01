@@ -80,25 +80,37 @@ pub async fn run(
     let mut report = Report::default();
     let now = Instant::now();
 
-    // Alarms: (system, tower, attacker, tower's alliance and corporation, where).
-    let alarms: Vec<(i32, i64, i64, Option<i64>, i64, Vec3, f64)> = {
+    // Alarms: (system, tower, attacker, tower's alliance and corporation,
+    // where, the attacking player).
+    let alarms: Vec<(i32, i64, i64, Option<i64>, i64, Vec3, f64, Option<i64>)> = {
         let mut w = world.lock();
         let mut found = Vec::new();
         for (system, park) in w.parks.iter_mut() {
             for (tower, attacker) in park.tower_alarms.drain(..) {
+                let player = park.ships.get(&attacker).filter(|s| s.is_player()).map(|s| s.pilot.char_id);
                 if let Some(t) = park.structures.get(&tower) {
-                    found.push((*system as i32, tower, attacker, t.alliance_id, t.corp_id, t.pos, t.field_radius.max(t.radius)));
+                    found.push((*system as i32, tower, attacker, t.alliance_id, t.corp_id, t.pos, t.field_radius.max(t.radius), player));
                 }
             }
         }
         found
     };
-    for (system, tower, attacker, alliance, corp, at, field) in alarms {
+    for (system, tower, attacker, alliance, corp, at, field, player) in alarms {
+        // A bot side's tower; or a player corporation's that bots belong to.
         let owners = match alliance.map(|a| a as i32) {
             Some(a) if p.alliances.contains_key(&a) => Owners::Alliance(a),
-            _ if p.corps.contains_key(&(corp as i32)) => Owners::Corporation(corp as i32),
+            _ if p.corps.contains_key(&(corp as i32)) || ids.iter().any(|id| id.corp == corp as i32) => Owners::Corporation(corp as i32),
             _ => continue,
         };
+        if let Some(player) = player {
+            let side = match owners {
+                Owners::Alliance(a) => a,
+                Owners::Corporation(c) => c,
+            };
+            if p.alliances.contains_key(&side) || p.corps.contains_key(&side) {
+                report.aggressors.push((side, player));
+            }
+        }
         if let Some(d) = defenses.iter_mut().find(|d| d.tower == tower) {
             d.last_alarm = now;
             if d.attacker != attacker {
@@ -122,7 +134,7 @@ pub async fn run(
         report.news.push((crate::bulkdata::filetime_now(), format!("{who}'s tower in {place} is under attack: a fleet is on its way")));
         let pilots: u32 = match owners {
             Owners::Alliance(a) => p.corps.values().filter(|c| c.alliance == Some(a)).map(|c| c.members).sum(),
-            Owners::Corporation(c) => p.corps.get(&c).map_or(0, |c| c.members),
+            Owners::Corporation(c) => p.corps.get(&c).map_or_else(|| ids.iter().filter(|id| id.corp == c).count() as u32 * PILOTS_PER_SHIP, |c| c.members),
         };
         let size = ((pilots / PILOTS_PER_SHIP) as usize).clamp(FLEET_MIN, FLEET_MAX).min(presence.cap() / 2);
         // Those already here answer at once.

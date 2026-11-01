@@ -19,7 +19,8 @@
 //! shuttles and capsules have nothing to shoot with.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use tracing::info;
 
@@ -44,8 +45,17 @@ pub const TYPE_CAPSULE: i64 = 670;
 static CAPSULE: OnceLock<NpcType> = OnceLock::new();
 /// How fast a bot flies when it is not in a hurry.
 const CRUISE: f64 = 0.5;
-/// Below this security, pirates attack players on sight.
+/// Below this security, pirates attack players on sight (`bots.piratesAttackPlayers`).
 const HIGH_SEC: f64 = 0.45;
+static PIRATES_ATTACK_PLAYERS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_pirates_attack_players(on: bool) {
+    PIRATES_ATTACK_PLAYERS.store(on, Ordering::Relaxed);
+}
+
+/// A shown bot destroyed by a player: (bot, killer, it was the capsule, the
+/// type lost).
+pub type BotKill = (u32, i64, bool, i64);
 
 /// What a bot is to anyone looking: its name, corporation, standing with the
 /// law, and the ship it flies.
@@ -83,6 +93,16 @@ pub struct Presence {
     /// Fleet bots called up while docked in their fleet's system: they come
     /// out of that station, not through a gate.
     undock: HashMap<u32, i32>,
+    /// Hired wingmen, and the player each flies with (`hire`).
+    escort: HashMap<u32, i64>,
+    /// Bots hunting a player (`relations`): they go for them on sight.
+    hunts: HashMap<u32, i64>,
+    /// Pirates raiding high-sec (`events`): they attack players anywhere.
+    pub raiders: HashSet<u32>,
+    /// What bots fly and fit.
+    pub yard: Option<Arc<super::ships::Shipyard>>,
+    /// Shown bots destroyed by players since the runtime last looked.
+    pub kills: Vec<BotKill>,
 }
 
 /// Where a bot in a fleet goes: in by warp to `point`, then around `anchor`
@@ -100,7 +120,38 @@ impl Presence {
         if let Some(capsule) = hulls.get(&TYPE_CAPSULE) {
             let _ = CAPSULE.set(capsule.clone());
         }
-        Presence { shown: HashMap::new(), hulls, observed: HashSet::new(), cap: cap.max(1), rally: HashMap::new(), undock: HashMap::new() }
+        Presence {
+            shown: HashMap::new(),
+            hulls,
+            observed: HashSet::new(),
+            cap: cap.max(1),
+            rally: HashMap::new(),
+            undock: HashMap::new(),
+            escort: HashMap::new(),
+            hunts: HashMap::new(),
+            raiders: HashSet::new(),
+            yard: None,
+            kills: Vec::new(),
+        }
+    }
+
+    /// A bot flies as a player's wingman.
+    pub fn escort(&mut self, i: u32, player: i64) {
+        self.escort.insert(i, player);
+    }
+
+    pub fn unescort(&mut self, i: u32) {
+        self.escort.remove(&i);
+    }
+
+    /// The bots out hunting, and whom.
+    pub fn set_hunts(&mut self, hunts: HashMap<u32, i64>) {
+        self.hunts = hunts;
+    }
+
+    /// Where a shown bot is: its system, and its ship.
+    pub fn shown_at(&self, i: u32) -> Option<(i32, i64)> {
+        self.shown.get(&i).copied()
     }
 
     /// The most bots shown in one system.
@@ -132,11 +183,19 @@ impl Presence {
 
     /// Whether a bot's hull carries guns.
     pub fn armed(&self, hull: i64) -> bool {
-        self.hulls.get(&hull).is_some_and(|h| arms(h, 0, false).is_some())
+        self.hulls.get(&hull).is_some_and(|h| arms(h, 0, false, 1.0).is_some())
     }
 
-    /// The course for a bot: its fleet's, or its errand's.
+    /// The course for a bot: its fleet's, its player's (a wingman), or its
+    /// errand's.
     fn course(&self, i: u32, bot: &Bot, park: &Park, from: Vec3) -> Command {
+        if let (Some(player), Activity::Escorting) = (self.escort.get(&i), bot.activity) {
+            return match player_ship(park, *player) {
+                Some(s) if (s.pos - from).len() > RALLY_WARP => Command::Warp { target: s.pos, range: 0.0 },
+                Some(s) => Command::Orbit { target: s.id, range: super::hire::ESCORT_RANGE },
+                None => Command::Stop,
+            };
+        }
         match self.rally.get(&i) {
             Some(r) if bot.activity == Activity::Sieging && bot.pod.is_none() => {
                 if (r.point - from).len() > RALLY_WARP {
@@ -205,12 +264,15 @@ impl Presence {
         // Lost ships leave their pilots in capsules, heading home; lost
         // capsules leave them at home.
         let mut lost = Vec::new();
-        let losses: Vec<(i64, i64, Option<i64>)> =
-            w.parks.iter_mut().flat_map(|(system, park)| park.bot_losses.drain(..).map(|(c, pod)| (*system, c, pod)).collect::<Vec<_>>()).collect();
-        for (system, char_id, pod) in losses {
-            let Some(&i) = by_char.get(&char_id) else { continue };
+        let losses: Vec<(i64, crate::ballpark::BotLoss)> =
+            w.parks.iter_mut().flat_map(|(system, park)| park.bot_losses.drain(..).map(|l| (*system, l)).collect::<Vec<_>>()).collect();
+        for (system, loss) in losses {
+            let Some(&i) = by_char.get(&loss.char_id) else { continue };
+            if loss.killer > 0 && !by_char.contains_key(&loss.killer) {
+                self.kills.push((i, loss.killer, loss.pod.is_none(), loss.type_id));
+            }
             let bot = &mut bots[i as usize];
-            match pod {
+            match loss.pod {
                 Some(capsule) => {
                     let wait = super::behaviour::podded(bot, capsule, atlas, rng);
                     self.shown.insert(i, (system as i32, capsule));
@@ -346,6 +408,45 @@ impl Presence {
             steer(&mut w, system as i64, ship, command);
         }
 
+        // Wingmen keep with their players.
+        let orders: Vec<(i32, i64, Command)> = self
+            .escort
+            .keys()
+            .filter_map(|i| {
+                let (system, ship) = *self.shown.get(i)?;
+                let b = &bots[*i as usize];
+                let park = w.parks.get(&(system as i64))?;
+                let s = park.ships.get(&ship)?;
+                if b.activity != Activity::Escorting || s.warping() || s.npc.as_ref().is_some_and(|brain| brain.engaged()) {
+                    return None;
+                }
+                let want = self.course(*i, b, park, s.pos);
+                (s.command != want).then_some((system, ship, want))
+            })
+            .collect();
+        for (system, ship, command) in orders {
+            steer(&mut w, system as i64, ship, command);
+        }
+
+        // Hunters close in on their prey, and go for it.
+        for (i, player) in &self.hunts {
+            let Some(&(system, ship)) = self.shown.get(i) else { continue };
+            let Some(park) = w.parks.get_mut(&(system as i64)) else { continue };
+            let Some((target, at)) = player_ship(park, *player).map(|s| (s.id, s.pos)) else { continue };
+            let Some(me) = park.ships.get(&ship) else { continue };
+            if me.warping() || me.npc.as_ref().is_none_or(|b| b.engaged()) {
+                continue;
+            }
+            if (at - me.pos).len() > 100_000.0 {
+                let command = Command::Warp { target: at, range: 0.0 };
+                if me.command != command {
+                    space::order(&mut w, system as i64, ship, command);
+                }
+            } else if let Some(brain) = park.ships.get_mut(&ship).and_then(|s| s.npc.as_mut()) {
+                brain.provoked(target);
+            }
+        }
+
         // Fleets with a target go for it.
         for (i, r) in &self.rally {
             let (Some(target), Some(&(system, ship))) = (r.target, self.shown.get(i)) else { continue };
@@ -384,10 +485,28 @@ impl Presence {
         if park.ships.contains_key(&ship_id) {
             return;
         }
-        let pos = at.unwrap_or_else(|| appear_at(bot, park));
+        let beside_player = self.escort.get(&i).filter(|_| bot.activity == Activity::Escorting).and_then(|p| player_ship(park, *p)).map(|s| {
+            let dir = Rng::seeded(bot.id as u64).in_sphere(1.0);
+            let dir = if dir.len() > 1e-6 { dir.unit() } else { Vec3::new(1.0, 0.0, 0.0) };
+            s.pos + dir * (s.stats.radius + 1_500.0)
+        });
+        let pos = beside_player.or(at).unwrap_or_else(|| appear_at(bot, park));
         let command = self.course(i, bot, park, pos);
-        let hostile = bot.role == super::behaviour::Role::Pirate && park.wildlife.security < HIGH_SEC;
-        let ship = ship_for(bot, id, ship_id, hull, pos, command, hostile, now);
+        let pirate = bot.role == super::behaviour::Role::Pirate && PIRATES_ATTACK_PLAYERS.load(Ordering::Relaxed);
+        let hostile = self.raiders.contains(&i) || (pirate && park.wildlife.security < HIGH_SEC);
+        // Its fitting and what it carries, for its wreck and its killmail.
+        let mut loot: Vec<(i64, i64)> = Vec::new();
+        let mut punch = 1.0;
+        if bot.pod.is_none() {
+            if let Some(yard) = &self.yard {
+                let fitting = yard.fitting(hull.type_id as i32, bot.id as u64, bot.isk > 1.0e9);
+                punch = yard.punch(&fitting);
+                loot.extend(fitting.into_iter().map(|(t, n)| (t as i64, n)));
+            }
+            loot.extend(bot.hold.iter().map(|(t, n)| (*t as i64, *n)));
+        }
+        let mut ship = ship_for(bot, id, ship_id, hull, pos, command, hostile, now, punch);
+        ship.bot_loot = loot;
         space::add_ship(w, system, ship);
         if let Some(gate) = gate {
             let tick = w.parks.get(&system).map_or(0, |p| p.tick);
@@ -424,7 +543,7 @@ fn steer(w: &mut WorldState, system: i64, ship: i64, command: Command) {
 /// the range it orbits at. Its hull has a player ship's attributes, not an
 /// NPC's weapons, so the guns are made to suit its class. None for hulls
 /// that carry no guns.
-pub fn arms(hull: &NpcType, ship_id: i64, pirate: bool) -> Option<(Vec<Active>, f64, f64)> {
+pub fn arms(hull: &NpcType, ship_id: i64, pirate: bool, punch: f64) -> Option<(Vec<Active>, f64, f64)> {
     // (damage per second, optimal, falloff, tracking, signature resolution, cycle ms)
     let (dps, optimal, falloff, tracking, sig, cycle) = match hull.group_id {
         // Frigates: plain, assault, covert ops, interceptors, electronic attack.
@@ -441,7 +560,7 @@ pub fn arms(hull: &NpcType, ship_id: i64, pirate: bool) -> Option<(Vec<Active>, 
         463 | 543 => (25.0, 8_000.0, 4_000.0, 0.5, 40.0, 4_000.0),
         _ => return None,
     };
-    let dps = if pirate { dps * 1.5 } else { dps };
+    let dps = if pirate { dps * 1.5 } else { dps } * punch;
     let shot = dps * cycle / 1_000.0;
     // EM, explosive, kinetic, thermal: hybrid and projectile fire, mostly.
     let damage = [0.0, shot * 0.2, shot * 0.4, shot * 0.4];
@@ -508,7 +627,7 @@ fn command_for(bot: &Bot, park: &Park, from: Vec3) -> Command {
                 None => Command::Stop,
             }
         }
-        Activity::Docked | Activity::Sieging => Command::Stop,
+        Activity::Docked | Activity::Sieging | Activity::Escorting => Command::Stop,
     }
 }
 
@@ -537,12 +656,18 @@ pub fn eject(park: &mut Park, ship: &Ship, now: i64, out: &mut crate::heartbeat:
         activity: Activity::Docked,
         route: Vec::new(),
         dock_at: 0,
-        cargo: 0.0,
+        hold: Vec::new(),
         isk: 0.0,
+        isk_saved: 0.0,
+        earned: 0.0,
         pod: Some(capsule),
         turf: 0,
+        hull: TYPE_CAPSULE as i32,
+        tier: 0,
+        hull_lost: false,
+        prime: 19,
     };
-    let pod = ship_for(&bot, &id, capsule, hull, ship.pos, Command::Stop, false, now);
+    let pod = ship_for(&bot, &id, capsule, hull, ship.pos, Command::Stop, false, now, 1.0);
     park.ships.insert(capsule, pod);
     for e in space::add_ball_entries(park, capsule) {
         out.destiny(park.solar_system_id, e);
@@ -550,8 +675,13 @@ pub fn eject(park: &mut Park, ship: &Ship, now: i64, out: &mut crate::heartbeat:
     Some(capsule)
 }
 
+/// A player's ship in a park, by its pilot.
+fn player_ship(park: &Park, char_id: i64) -> Option<&Ship> {
+    park.ships.values().find(|s| s.is_player() && s.pilot.char_id == char_id)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn ship_for(bot: &Bot, id: &Identity, ship_id: i64, hull: &NpcType, pos: Vec3, command: Command, hostile: bool, now: i64) -> Ship {
+fn ship_for(bot: &Bot, id: &Identity, ship_id: i64, hull: &NpcType, pos: Vec3, command: Command, hostile: bool, now: i64, punch: f64) -> Ship {
     let a = |x: i32| hull.get(x);
     let top = a(attr::MAX_VELOCITY).max(50.0);
     let agility = if a(attr::AGILITY) > 0.0 { a(attr::AGILITY) } else { 1.0 };
@@ -569,7 +699,7 @@ fn ship_for(bot: &Bot, id: &Identity, ship_id: i64, hull: &NpcType, pos: Vec3, c
     };
     let mut ship = Ship::new(ship_id, 0, stats, pilot, pos, Vec3::ZERO);
     ship.bot = true;
-    let armed = arms(hull, ship_id, bot.role == super::behaviour::Role::Pirate);
+    let armed = arms(hull, ship_id, bot.role == super::behaviour::Role::Pirate, punch);
     let lock_range = armed.as_ref().map_or(30_000.0, |(_, reach, _)| (reach * 1.5).max(30_000.0));
     ship.fight = Some(crate::npc::entity_fighter(hull, lock_range, 1, top, now));
     if let Some((weapons, reach, fly)) = armed {
@@ -581,8 +711,8 @@ fn ship_for(bot: &Bot, id: &Identity, ship_id: i64, hull: &NpcType, pos: Vec3, c
 }
 
 /// The hull types bots fly, loaded once.
-pub async fn hulls(db: &tokio_postgres::Client, ids: &[Identity]) -> HashMap<i64, NpcType> {
-    let mut types: Vec<i64> = ids.iter().map(|i| i.hull).filter(|h| *h != 0).chain([TYPE_CAPSULE]).collect();
+pub async fn hulls(db: &tokio_postgres::Client, ids: &[Identity], more: impl IntoIterator<Item = i64>) -> HashMap<i64, NpcType> {
+    let mut types: Vec<i64> = ids.iter().map(|i| i.hull).filter(|h| *h != 0).chain([TYPE_CAPSULE]).chain(more).collect();
     types.sort_unstable();
     types.dedup();
     match crate::npc::load_types(db, &types).await {
@@ -629,7 +759,7 @@ mod tests {
     fn miner() -> (Bot, Identity) {
         let bot = Bot {
             id: 140_500_000, role: super::super::behaviour::Role::Miner, home: 60_000_001, system: HERE, station: 0, online: true,
-            share: 0.3, session_end: u32::MAX, activity: Activity::Mining, route: Vec::new(), dock_at: 0, cargo: 0.0, isk: 0.0, pod: None, turf: 0,
+            share: 0.3, session_end: u32::MAX, activity: Activity::Mining, route: Vec::new(), dock_at: 0, hold: Vec::new(), isk: 0.0, isk_saved: 0.0, earned: 0.0, pod: None, turf: 0, hull: 587, tier: 0, hull_lost: false, prime: 19,
         };
         let id = Identity { name: "Bot Miner".into(), corp: 1000044, security: 0.5, ship: 140_500_001, hull: 587, alliance: None };
         (bot, id)
@@ -762,8 +892,8 @@ mod tests {
         let capsule = NpcType::with(TYPE_CAPSULE, 29, 25.0, 32_000.0, &[]);
         let industrial = NpcType::with(648, 28, 100.0, 1e7, &[]);
         let battleship = NpcType::with(641, 27, 400.0, 1e8, &[]);
-        assert!(arms(&shuttle, 1, false).is_none() && arms(&capsule, 1, false).is_none() && arms(&industrial, 1, false).is_none());
-        let (guns, reach, _) = arms(&battleship, 1, false).unwrap();
+        assert!(arms(&shuttle, 1, false, 1.0).is_none() && arms(&capsule, 1, false, 1.0).is_none() && arms(&industrial, 1, false, 1.0).is_none());
+        let (guns, reach, _) = arms(&battleship, 1, false, 1.0).unwrap();
         assert_eq!(guns.len(), 1);
         assert!(reach > 40_000.0);
     }
@@ -784,7 +914,7 @@ mod tests {
             let park = w.parks.get_mut(&(HERE as i64)).unwrap();
             let ship = park.ships.remove(&ids[0].ship).unwrap();
             let pod = eject(park, &ship, 0, &mut crate::heartbeat::Out::default()).unwrap();
-            park.bot_losses.push((bots[0].id as i64, Some(pod)));
+            park.bot_losses.push(crate::ballpark::BotLoss { char_id: bots[0].id as i64, pod: Some(pod), killer: 0, type_id: 587 });
             pod
         };
         let lost = p.sync(&world, &atlas, &mut bots, &ids, &by_char, Vec::new(), &mut rng);
@@ -802,7 +932,7 @@ mod tests {
             let mut w = world.lock();
             let park = w.parks.get_mut(&(HERE as i64)).unwrap();
             park.ships.remove(&capsule);
-            park.bot_losses.push((bots[0].id as i64, None));
+            park.bot_losses.push(crate::ballpark::BotLoss { char_id: bots[0].id as i64, pod: None, killer: 0, type_id: TYPE_CAPSULE });
         }
         p.sync(&world, &atlas, &mut bots, &ids, &by_char, Vec::new(), &mut rng);
         assert_eq!((bots[0].station, bots[0].system, bots[0].pod), (60_000_001, THERE, None));

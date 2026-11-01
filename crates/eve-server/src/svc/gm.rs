@@ -11,7 +11,9 @@
 //! - /setstanding <ownerID> <standing>: an NPC's standing toward you;
 //! - /spawn: a group of the system's rats, around your ship;
 //! - /tr me <station | system | celestial | character>;
-//! - /bots on|off|status: the bot population;
+//! - /bots on|off|status: the bot population; /bots event <betrayal |
+//!   merger | collapse | coalition | raid>, /bots war <a> | <b>, /bots
+//!   density <region> <factor>, /bots follow <name>: steering it;
 //! - /help.
 //! A type or a skill is its ID or its name.
 
@@ -39,7 +41,7 @@ const ATTR_SKILL_LEVEL: i32 = 280;
 const REF_GM: i32 = 25;
 const OWNER_SYSTEM: i64 = 1;
 
-const HELP: &str = "/create <type> [qty], /giveisk <amount>, /giveskill <skill> [level], /setstanding <ownerID> <standing>, /spawn, /tr me <place or pilot>, /bots on|off|status";
+const HELP: &str = "/create <type> [qty], /giveisk <amount>, /giveskill <skill> [level], /setstanding <ownerID> <standing>, /spawn, /tr me <place or pilot>, /bots on|off|status|event <kind>|war <a> | <b>|density <region> <x>|follow <name>";
 
 pub async fn slash(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
     if call.method != "SlashCmd" {
@@ -70,7 +72,8 @@ pub async fn slash(call: &Call, ctx: &Ctx<'_>) -> Option<Outcome> {
                 crate::bots::set_running(false);
                 Ok("The bots are paused.".into())
             }
-            _ => Ok(crate::bots::status()),
+            Some("status") | None => Ok(crate::bots::status()),
+            Some(_) => crate::bots::request(&rest),
         },
         other => Err(format!("Unknown command /{other}. {HELP}")),
     };

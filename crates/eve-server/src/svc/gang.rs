@@ -158,11 +158,14 @@ async fn invite(ctx: &Ctx<'_>, me: i64, invitee: i64, ignore_wars: bool) -> Refu
     if invitee == me || invitee == 0 {
         return Err(Outcome::custom("You cannot invite yourself."));
     }
-    let (online, mine) = {
+    let (online, mine, bot) = {
         let w = ctx.world.lock();
         let mine = w.gangs.of(me).and_then(|id| w.gangs.get(id).map(|g| (id, g.clone())));
-        (w.is_online(invitee), mine)
+        (w.is_online(invitee), mine, w.bot_index.contains_key(&invitee))
     };
+    if bot {
+        return invite_bot(ctx, me, invitee, mine.as_ref());
+    }
     if !online {
         return Err(message_with("GangCandidateOffline", &[("invitee", Value::text(name_of(ctx.db, invitee).await))]));
     }
@@ -223,6 +226,65 @@ async fn invite(ctx: &Ctx<'_>, me: i64, invitee: i64, ignore_wars: bool) -> Refu
     w.notify(&w.clients_of(invitee), "OnGangInvite", event);
     info!("{me} invited {invitee} to gang {gang_id}");
     Ok(Value::None)
+}
+
+/// An invitation to a bot is an offer to hire it (bots::hire): the gang
+/// forms around the caller as for any invitation, and the bot answers when
+/// the simulation next looks.
+fn invite_bot(ctx: &Ctx<'_>, me: i64, invitee: i64, mine: Option<&(i64, Gang)>) -> Refused<Value> {
+    if let Some((_, g)) = mine {
+        if g.sitting_leader().is_some_and(|l| l != me) {
+            return Err(message("gangMustBeLeader"));
+        }
+        if g.members.contains(&invitee) {
+            return Err(message("gangMemberAlreadyInGroup"));
+        }
+    }
+    let mut w = ctx.world.lock();
+    let gang_id = match w.gangs.of(me) {
+        Some(id) => id,
+        None => {
+            let id = w.gangs.form(me);
+            set_session(&w, me, Some(id), true);
+            tell_system(&w, me, Some(id));
+            info!("{me} formed gang {id}");
+            id
+        }
+    };
+    if let Some(g) = w.gangs.gangs.get_mut(&gang_id) {
+        if !g.invited.contains(&invitee) {
+            g.invited.push(invitee);
+        }
+    }
+    w.hire_requests.push((me, invitee));
+    info!("{me} offered to hire bot {invitee} into gang {gang_id}");
+    Ok(Value::None)
+}
+
+/// A hired bot joins the gang it was invited to.
+pub fn bot_joins(w: &mut WorldState, gang_id: i64, bot: i64) {
+    let Some(g) = w.gangs.gangs.get_mut(&gang_id) else { return };
+    g.invited.retain(|c| *c != bot);
+    let before = g.members.clone();
+    w.gangs.join(gang_id, bot);
+    tell(w, &before, "OnGangJoin", vec![Value::Int(bot), Value::text(ACTIVE)]);
+    for m in &before {
+        tell_system(w, *m, Some(gang_id));
+    }
+}
+
+/// A bot turned an offer down: off every invitation list.
+pub fn bot_declines(w: &mut WorldState, bot: i64) {
+    for g in w.gangs.gangs.values_mut() {
+        g.invited.retain(|c| *c != bot);
+    }
+}
+
+/// A hired bot leaves its gang (its contract is over).
+pub fn bot_leaves(w: &mut WorldState, bot: i64) {
+    if let Some(gang_id) = w.gangs.of(bot) {
+        part(w, gang_id, bot, false);
+    }
 }
 
 /// AcceptInvitation(gangID): out of any other gang, into this one.

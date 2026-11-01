@@ -18,6 +18,11 @@
     <a href="#w-sieges" title="Sieges">SIE</a>
     <a href="#w-news" title="Galactic News">NEW</a>
     <a href="#w-kills" title="Kill Reports">KIL</a>
+    <a href="#w-killboard" title="Killboard">KB</a>
+    <a href="#w-market" title="Market">MKT</a>
+    <a href="#w-relations" title="Standings">STD</a>
+    <a href="#w-follow" title="Follow a Pilot">FOL</a>
+    <a href="#w-control" title="Events and Controls">CTL</a>
     <div class="clock" title="EVE time (UTC)"><span id="clock-time">--:--</span><span id="clock-date"></span></div>
   </nav>
 
@@ -68,6 +73,71 @@
     <section class="window wide" id="w-kills">
       <header class="caption"><span class="glyph"></span><h2>Kill Reports</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
       <div class="body"><table id="kills"></table></div>
+    </section>
+
+    <section class="window" id="w-killboard">
+      <header class="caption"><span class="glyph"></span><h2>Killboard (24h)</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body">
+        <p class="note" id="killboard-total"></p>
+        <table id="killboard"></table>
+        <table id="killboard-ships"></table>
+      </div>
+    </section>
+
+    <section class="window wide" id="w-market">
+      <header class="caption"><span class="glyph"></span><h2>Market</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body">
+        <div class="toolbar"><label>Hub <select id="hub"></select></label><span class="note" id="market-summary"></span></div>
+        <table id="market"></table>
+        <p class="note" id="market-shortages"></p>
+      </div>
+    </section>
+
+    <section class="window" id="w-relations">
+      <header class="caption"><span class="glyph"></span><h2>Standings</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body">
+        <p class="note" id="relations-summary"></p>
+        <table id="relations"></table>
+        <table id="wingmen"></table>
+      </div>
+    </section>
+
+    <section class="window wide" id="w-follow">
+      <header class="caption"><span class="glyph"></span><h2>Follow a Pilot</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body">
+        <div class="toolbar">
+          <input id="pilot-search" type="search" placeholder="Pilot name" autocomplete="off">
+          <span id="pilot-results"></span>
+        </div>
+        <table id="followed"></table>
+        <ol class="history" id="history"></ol>
+      </div>
+    </section>
+
+    <section class="window" id="w-control">
+      <header class="caption"><span class="glyph"></span><h2>Events and Controls</h2><button class="min" type="button" aria-label="Minimize">_</button></header>
+      <div class="body">
+        <p class="note" id="controls-state"></p>
+        <div class="toolbar" id="event-buttons">
+          <button type="button" data-do="event raid">Pirate raid</button>
+          <button type="button" data-do="event betrayal">Betrayal</button>
+          <button type="button" data-do="event merger">Merger</button>
+          <button type="button" data-do="event collapse">Collapse</button>
+          <button type="button" data-do="event coalition">Coalition</button>
+        </div>
+        <form class="toolbar" id="war-form">
+          <input name="a" placeholder="Alliance" required> <span class="hostile">vs</span> <input name="b" placeholder="Alliance" required>
+          <button type="submit">Start war</button>
+        </form>
+        <form class="toolbar" id="density-form">
+          <input name="region" placeholder="Region" required>
+          <input name="factor" type="number" min="0" max="5" step="0.1" value="1" required>
+          <button type="submit">Set busyness</button>
+        </form>
+        <p class="note" id="control-reply"></p>
+        <table id="raids"></table>
+        <table id="events"></table>
+      </div>
     </section>
   </main>
 </body>

@@ -32,7 +32,7 @@ use crate::svc::rows::{int, text};
 const KIND_INDUSTRIAL_CORP: i16 = 1;
 const KIND_COMBAT_CORP: i16 = 2;
 pub(super) const KIND_NULL_ALLIANCE: i16 = 11;
-const KIND_PIRATE_ALLIANCE: i16 = 12;
+pub(super) const KIND_PIRATE_ALLIANCE: i16 = 12;
 const KIND_INDUSTRY_ALLIANCE: i16 = 13;
 
 /// The share of bots that join bot corporations at the start.
@@ -84,6 +84,16 @@ pub struct Politics {
     /// The latest of what happened in null-sec, oldest first, for the dashboard.
     pub news: VecDeque<super::sov::News>,
     neighbours: HashMap<i32, HashSet<i32>>,
+    /// Each alliance's executor corporation's wallet, as last read.
+    pub treasury: HashMap<i32, f64>,
+    /// Each alliance's prime time (UTC hour), and the hour it is now.
+    pub primes: HashMap<i32, u8>,
+    pub hour: f64,
+    /// Fights nobody saw since the last save: (lost, its killer, system,
+    /// the hull lost), for the kill reports.
+    pub unseen_kills: Vec<(u32, u32, i32, i32)>,
+    /// How fast the bots' clock runs.
+    pub speed: f64,
 }
 
 impl Politics {
@@ -97,6 +107,44 @@ impl Politics {
     fn side(&self, corp: i32) -> Option<i32> {
         let c = self.corps.get(&corp)?;
         Some(c.alliance.unwrap_or(corp))
+    }
+
+    /// A bot corporation's side: its alliance, or itself outside one.
+    pub fn side_of(&self, corp: i32) -> Option<i32> {
+        self.side(corp)
+    }
+
+    /// An alliance's prime time: one of the bots' four, by its ID.
+    pub fn prime_of(&self, alliance: i32) -> u8 {
+        self.primes.get(&alliance).copied().unwrap_or_else(|| behaviour::PRIME_TIMES[(alliance.unsigned_abs() as usize / 7) % 4])
+    }
+
+    /// Whether it is an alliance's prime time, give or take three hours.
+    pub fn in_prime(&self, alliance: i32) -> bool {
+        let d = (self.hour - self.prime_of(alliance) as f64).rem_euclid(24.0);
+        d.min(24.0 - d) <= 3.0
+    }
+
+    pub fn new(atlas: &Atlas) -> Politics {
+        Politics {
+            corps: HashMap::new(),
+            alliances: HashMap::new(),
+            wars: Vec::new(),
+            kills: 0,
+            lost: 0,
+            news: VecDeque::new(),
+            neighbours: region_neighbours(atlas),
+            treasury: HashMap::new(),
+            primes: HashMap::new(),
+            hour: 0.0,
+            unseen_kills: Vec::new(),
+            speed: 1.0,
+        }
+    }
+
+    /// The regions next to one, across a gate.
+    pub fn neighbours_of(&self, region: i32) -> HashSet<i32> {
+        self.neighbours.get(&region).cloned().unwrap_or_default()
     }
 
     pub fn summary(&self) -> String {
@@ -130,7 +178,8 @@ fn filetime_now() -> i64 {
 
 /// What the database holds of bot politics, if it has been formed.
 pub async fn load(db: &Client, atlas: &Atlas, clock: u32, speed: f64) -> Result<Politics, tokio_postgres::Error> {
-    let mut p = Politics { corps: HashMap::new(), alliances: HashMap::new(), wars: Vec::new(), kills: 0, lost: 0, news: VecDeque::new(), neighbours: region_neighbours(atlas) };
+    let mut p = Politics::new(atlas);
+    p.speed = speed;
     let sql = r#"SELECT g."ownerID", g."kind", g."regionID", co."allianceID", co."memberCount"
                    FROM "botGroups" g LEFT JOIN "corporation" co ON co."corporationID" = g."ownerID""#;
     for r in db.query(sql, &[]).await? {
@@ -540,7 +589,8 @@ pub async fn form(db: &mut Client, atlas: &Atlas, bots: &mut [Bot], ids: &mut [I
     tx.commit().await?;
 
     // And in memory.
-    let mut p = Politics { corps: HashMap::new(), alliances: HashMap::new(), wars: Vec::new(), kills: 0, lost: 0, news: VecDeque::new(), neighbours: region_neighbours(atlas) };
+    let mut p = Politics::new(atlas);
+    p.speed = speed;
     for a in &used_sorted {
         p.alliances.insert(alliance_id[a], Alliance { kind: alliances[*a].kind, region: alliances[*a].region });
     }
@@ -669,24 +719,30 @@ async fn start_wars(p: &mut Politics, db: &Client, rng: &mut Rng, clock: u32, sp
             continue;
         }
         let days = WAR_DAYS.0 + rng.below((WAR_DAYS.1 - WAR_DAYS.0 + 1) as usize) as u32;
-        let length = days * DAY;
-        let now = filetime_now();
-        let finished = now + (length as f64 / speed.max(0.001)) as i64 * SECOND_FT;
-        // Dated a day back: bot wars are fought from the start, not after
-        // the day's notice a declared war gives.
-        let declared = now - crate::svc::war::DAY;
-        let id: i32 = db
-            .query_one(
-                r#"INSERT INTO "crpWars" ("warID","declaredByID","againstID","timeDeclared","timeFinished","mutual")
-                   VALUES (nextval('dyn_id_seq'), $1, $2, $3, $4, 1) RETURNING "warID""#,
-                &[&a, &b, &declared, &finished],
-            )
-            .await?
-            .get(0);
-        info!("bots: war {id}: {a} against {b}, for {days} days");
-        p.wars.push(War { id, a, b, ends: clock + length, kills: 0 });
+        war_between(p, db, a, b, days, clock, speed).await?;
     }
     Ok(())
+}
+
+/// A bot war between two sides, for `days` of the bots' clock. Returns its ID.
+pub async fn war_between(p: &mut Politics, db: &Client, a: i32, b: i32, days: u32, clock: u32, speed: f64) -> Result<i32, tokio_postgres::Error> {
+    let length = days * DAY;
+    let now = filetime_now();
+    let finished = now + (length as f64 / speed.max(0.001)) as i64 * SECOND_FT;
+    // Dated a day back: bot wars are fought from the start, not after the
+    // day's notice a declared war gives.
+    let declared = now - crate::svc::war::DAY;
+    let id: i32 = db
+        .query_one(
+            r#"INSERT INTO "crpWars" ("warID","declaredByID","againstID","timeDeclared","timeFinished","mutual")
+               VALUES (nextval('dyn_id_seq'), $1, $2, $3, $4, 1) RETURNING "warID""#,
+            &[&a, &b, &declared, &finished],
+        )
+        .await?
+        .get(0);
+    info!("bots: war {id}: {a} against {b}, for {days} days");
+    p.wars.push(War { id, a, b, ends: clock + length, kills: 0 });
+    Ok(id)
 }
 
 /// Every minute of the bots' clock: where enemies share a system nobody is
@@ -722,7 +778,7 @@ pub fn skirmish(p: &mut Politics, atlas: &Atlas, bots: &mut [Bot], ids: &[Identi
                     continue;
                 }
                 // The smaller side is the likelier loser.
-                let loser = if rng.unit() < mb.len() as f64 / (ma.len() + mb.len()) as f64 { ma } else { mb };
+                let (loser, winner) = if rng.unit() < mb.len() as f64 / (ma.len() + mb.len()) as f64 { (ma, mb) } else { (mb, ma) };
                 let n = 1 + rng.below(loser.len().min(3));
                 for k in 0..n {
                     let i = loser[(k * 7919 + rng.below(loser.len())) % loser.len()];
@@ -730,6 +786,8 @@ pub fn skirmish(p: &mut Politics, atlas: &Atlas, bots: &mut [Bot], ids: &[Identi
                     if bot.station != 0 {
                         continue;
                     }
+                    let killer = winner[rng.below(winner.len())];
+                    p.unseen_kills.push((i, killer, bot.system, bot.hull));
                     lost.push((i, behaviour::reclone(bot, atlas, rng)));
                     p.wars[war].kills += 1;
                     p.kills += 1;

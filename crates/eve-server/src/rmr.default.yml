@@ -49,6 +49,14 @@ bots:
   # (RMR_BOTS_SHOWN). More makes bigger battles, and more work for the
   # server and the clients there.
   shownPerSystem: 120
+  # Whether bot pirates attack players on sight outside high-sec
+  # (RMR_BOTS_PIRATES_ATTACK). Bots whose side a player has angered, and
+  # pirates raiding high-sec, attack them anyway.
+  piratesAttackPlayers: true
+  # Whether the web dashboard may steer the bots: start events and wars,
+  # make a region busier or quieter (RMR_BOTS_CONTROLS). The dashboard has
+  # no login, so only turn this on where only you can reach it.
+  dashboardControls: false
 
 # Accounts made, or brought into line with this file, at every start.
 # Accounts not listed here are left as they are; removing one from the

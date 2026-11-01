@@ -48,6 +48,13 @@ pub const SIEGE_NOTICE: u32 = 15 * 60;
 /// An alliance's chance, per tick, to anchor in an unclaimed home system.
 const EXPAND_CHANCE: f64 = 0.05;
 const SECOND_FT: i64 = 10_000_000;
+/// What an alliance pays its executor's wallet: to anchor a tower, and to
+/// keep each in fuel (each politics tick, about 5M ISK a day). An alliance
+/// that cannot pay lets its towers run dry.
+pub const TOWER_COST: f64 = 150_000_000.0;
+const UPKEEP_PER_TICK: f64 = 35_000.0;
+/// Treasury at which an alliance fields twice the ships its pilots alone would.
+const RICH: f64 = 5_000_000_000.0;
 
 /// What happened, for the news.
 pub type News = (i64, String);
@@ -209,7 +216,8 @@ pub async fn refuel(db: &Client) -> Result<u64, tokio_postgres::Error> {
                      SELECT p."itemID", e."typeID", e."ownerID" FROM "posStructures" p
                        JOIN entity e ON e."itemID" = p."itemID"
                        JOIN "botGroups" g ON g."ownerID" = e."ownerID"
-                      WHERE p."controlTowerID" IS NULL AND p."state" IN (2, 3, 4, 5)),
+                       JOIN "corporation" co ON co."corporationID" = e."ownerID"
+                      WHERE p."controlTowerID" IS NULL AND p."state" IN (2, 3, 4, 5) AND co."balance" > 0),
                  needs AS (
                      SELECT t."itemID", t."ownerID", r."resourceTypeID" AS kind,
                             CASE WHEN r."purpose" = $2 THEN $4::bigint ELSE r."quantity"::bigint * $3 END AS target
@@ -240,6 +248,15 @@ pub async fn upkeep(
     claim_delay_secs: i64,
     speed: f64,
 ) -> Result<Vec<News>, tokio_postgres::Error> {
+    // Fuel costs money: each bot corporation pays for its towers.
+    db.execute(
+        r#"UPDATE "corporation" co SET "balance" = co."balance" - t.n * $1
+             FROM (SELECT e."ownerID", count(*)::float8 AS n FROM "posStructures" p JOIN entity e ON e."itemID" = p."itemID"
+                    JOIN "botGroups" g ON g."ownerID" = e."ownerID" WHERE p."controlTowerID" IS NULL GROUP BY 1) t
+            WHERE co."corporationID" = t."ownerID""#,
+        &[&UPKEEP_PER_TICK],
+    )
+    .await?;
     refuel(db).await?;
     let now = crate::bulkdata::filetime_now();
     // A new claim waits out the delay, run at the bots' speed.
@@ -264,9 +281,12 @@ pub async fn upkeep(
     let wars: Vec<(i32, i32, i32)> = p.wars.iter().map(|w| (w.a, w.b, w.id)).collect();
     for (a, b, war) in wars {
         let (Some(&(_, attacker_exec, attacker_race, attackers)), Some(&(_, _, _, defenders))) = (info.get(&a), info.get(&b)) else { continue };
-        if sieges.iter().any(|s| s.war == war) || rng.unit() >= SIEGE_CHANCE {
+        if sieges.iter().any(|s| s.war == war) || rng.unit() >= SIEGE_CHANCE || !p.in_prime(a) {
             continue;
         }
+        // Rich alliances field more ships than their numbers alone would.
+        let wealth = |side: i32| 1.0 + (p.treasury.get(&side).copied().unwrap_or(0.0) / RICH).clamp(0.0, 1.0);
+        let (attackers, defenders) = ((attackers as f64 * wealth(a)) as u32, (defenders as f64 * wealth(b)) as u32);
         // A defender's system next to the attacker's space, else any of theirs.
         let mut theirs: Vec<i32> = towers.keys().copied().filter(|s| has(&towers, s, b) && !sieges.iter().any(|x| x.system == *s)).collect();
         theirs.sort_unstable();
@@ -322,6 +342,11 @@ pub async fn upkeep(
             .collect();
         let Some(&system) = empty.get(rng.below(empty.len().max(1))) else { continue };
         let tower_type = TOWERS.iter().find(|(r, _)| r == race).map_or(TOWERS[2].1, |(_, t)| *t);
+        // A tower is bought out of the executor's wallet, or not at all.
+        let paid = db.execute(r#"UPDATE "corporation" SET "balance" = "balance" - $2 WHERE "corporationID" = $1 AND "balance" >= $2"#, &[executor, &TOWER_COST]).await?;
+        if paid == 0 {
+            continue;
+        }
         if let Some(place) = spot(db, system, rng).await? {
             anchor(db, *executor, tower_type, &place, claim_since).await?;
             towers.entry(system).or_default().insert(*alliance);
@@ -357,6 +382,8 @@ pub async fn conclude(
         return Ok((now, format!("{} were driven back from {} by {}", n.attacker, n.system, n.defender)));
     }
     let gone = destroy_towers(db, s.system, s.defender).await?;
+    // The victors buy their tower with what is left in their executor's wallet.
+    db.execute(r#"UPDATE "corporation" SET "balance" = "balance" - LEAST(GREATEST("balance", 0), $2) WHERE "corporationID" = $1"#, &[&s.attacker_exec, &TOWER_COST]).await?;
     let delay = claim_delay_secs as f64;
     let claim_since = now - ((delay - delay / speed.max(1.0)) as i64) * SECOND_FT;
     let tower_type = TOWERS.iter().find(|(r, _)| *r == s.attacker_race).map_or(TOWERS[2].1, |(_, t)| *t);

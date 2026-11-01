@@ -1,9 +1,14 @@
 //! The web dashboard: a page, built in, and the JSON it reads, showing
 //! who is playing, the wars under way, the alliances and the space they
-//! hold, the busiest systems, the news from null-sec and the latest kills. `RMR_WEB` is where it listens (empty: off).
+//! hold, the busiest systems, the news from null-sec, the latest kills and
+//! the killboard, the bots' market, their feelings about players, the
+//! pilots being followed and politics' upheavals. `RMR_WEB` is where it
+//! listens (empty: off).
 //!
-//! It answers GET alone and closes each connection after its answer: a
-//! dashboard polling every few seconds needs no more. It only reads.
+//! It answers GET, and closes each connection after its answer: a dashboard
+//! polling every few seconds needs no more. The one thing it changes is the
+//! bots (POST /api/control, with the request in `do`), and only when
+//! `bots.dashboardControls` allows it.
 //!
 //! The page is TypeScript (web/src/app.ts), compiled to web/dist/app.js with
 //! `npm run build` in crates/eve-server/web; the compiled file is part of the
@@ -73,10 +78,24 @@ async fn answer(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
     let head = String::from_utf8_lossy(&buf);
     let mut parts = head.lines().next().unwrap_or("").split_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or("/"));
+    let path = target.split('?').next().unwrap_or("/");
+    if method == "POST" && path == "/api/control" {
+        let query = target.split_once('?').map_or("", |(_, q)| q);
+        let asked = query.split('&').find_map(|kv| kv.strip_prefix("do=")).map(decode).unwrap_or_default();
+        let (status, body) = if !crate::bots::controls_enabled() {
+            (403, json!({ "error": "Dashboard controls are off (bots.dashboardControls in rmr.yml)." }))
+        } else {
+            let words: Vec<&str> = asked.split_whitespace().collect();
+            match crate::bots::request(&words) {
+                Ok(said) => (200, json!({ "ok": said })),
+                Err(why) => (400, json!({ "error": why })),
+            }
+        };
+        return respond(&mut stream, status, "application/json", body.to_string().as_bytes()).await;
+    }
     if method != "GET" {
         return respond(&mut stream, 405, "text/plain", b"Only GET").await;
     }
-    let path = target.split('?').next().unwrap_or("/");
     match path {
         "/" | "/index.html" => respond(&mut stream, 200, "text/html; charset=utf-8", INDEX.as_bytes()).await,
         "/style.css" => respond(&mut stream, 200, "text/css; charset=utf-8", STYLE.as_bytes()).await,
@@ -92,6 +111,16 @@ async fn answer(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
                 "/api/corporations" => Some(corporations(server).await),
                 "/api/systems" => Some(systems(server).await),
                 "/api/kills" => Some(kills(server).await),
+                "/api/killboard" => Some(killboard(server).await),
+                "/api/market" => Some(Ok(server.world.lock().bot_panels.market.clone())),
+                "/api/relations" => Some(Ok(server.world.lock().bot_panels.relations.clone())),
+                "/api/followed" => Some(Ok(server.world.lock().bot_panels.followed.clone())),
+                "/api/events" => Some(Ok(server.world.lock().bot_panels.events.clone())),
+                "/api/pilots" => {
+                    let query = target.split_once('?').map_or("", |(_, q)| q);
+                    let q = query.split('&').find_map(|kv| kv.strip_prefix("q=")).map(decode).unwrap_or_default();
+                    Some(Ok(pilots(server, &q)))
+                }
                 _ => None,
             };
             match body {
@@ -110,6 +139,8 @@ async fn answer(mut stream: TcpStream, server: &Server) -> std::io::Result<()> {
 async fn respond(stream: &mut TcpStream, status: u16, kind: &str, body: &[u8]) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         431 => "Request Header Fields Too Large",
@@ -317,6 +348,75 @@ async fn systems(server: &Server) -> Answer {
             })
             .collect(),
     ))
+}
+
+/// A query string's value: `+` for spaces, `%XX` for bytes.
+fn decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                match u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16) {
+                    Ok(b) => {
+                        out.push(b);
+                        i += 2;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Bots whose names start with (or contain) `q`, for following one.
+fn pilots(server: &Server, q: &str) -> Json {
+    let q = q.trim().to_lowercase();
+    if q.len() < 2 {
+        return Json::Array(Vec::new());
+    }
+    let roster = std::sync::Arc::clone(&server.world.lock().bot_roster);
+    let mut found: Vec<&crate::world::LocalBot> = roster.iter().filter(|b| b.name.to_lowercase().starts_with(&q)).take(15).collect();
+    if found.len() < 15 {
+        found.extend(roster.iter().filter(|b| !b.name.to_lowercase().starts_with(&q) && b.name.to_lowercase().contains(&q)).take(15 - found.len()));
+    }
+    Json::Array(found.iter().map(|b| json!({ "id": b.char_id, "name": b.name })).collect())
+}
+
+/// The last day's kills and losses by alliance (or corporation outside
+/// one), bots' unseen fights included.
+async fn killboard(server: &Server) -> Answer {
+    let since = crate::bulkdata::filetime_now() - 24 * 3_600 * 10_000_000;
+    let sql = r#"WITH recent AS (SELECT * FROM "killLog" WHERE "killTime" > $1),
+                      k AS (SELECT COALESCE(NULLIF(p."allianceID", 0), p."corporationID") AS side, count(*)::int AS n
+                              FROM "killLogParticipants" p JOIN recent r ON r."killID" = p."killID" WHERE p."finalBlow" = 1 GROUP BY 1),
+                      l AS (SELECT COALESCE(NULLIF(r."victimAllianceID", 0), r."victimCorpID") AS side, count(*)::int AS n FROM recent r GROUP BY 1),
+                      sides AS (SELECT side FROM k UNION SELECT side FROM l)
+                 SELECT s.side AS id, COALESCE(a."allianceName", c."corporationName", '?') AS name,
+                        COALESCE(a."shortName", c."tickerName", '') AS ticker,
+                        COALESCE(k.n, 0) AS kills, COALESCE(l.n, 0) AS losses,
+                        EXISTS (SELECT 1 FROM "botGroups" g WHERE g."ownerID" = s.side) AS bots
+                   FROM sides s LEFT JOIN k ON k.side = s.side LEFT JOIN l ON l.side = s.side
+                   LEFT JOIN alliances a ON a."allianceID" = s.side LEFT JOIN "corporation" c ON c."corporationID" = s.side
+                  ORDER BY kills DESC, losses DESC LIMIT 30"#;
+    let sides = rows(&server.db.query(sql, &[&since]).await?);
+    let total: i64 = server.db.query_one(r#"SELECT count(*) FROM "killLog" WHERE "killTime" > $1"#, &[&since]).await?.get(0);
+    let ships = rows(
+        &server
+            .db
+            .query(
+                r#"SELECT t."typeName" AS ship, count(*)::int AS lost FROM "killLog" k JOIN "invTypes" t ON t."typeID" = k."victimShipTypeID"
+                    WHERE k."killTime" > $1 GROUP BY 1 ORDER BY 2 DESC LIMIT 10"#,
+                &[&since],
+            )
+            .await?,
+    );
+    Ok(json!({ "total": total, "sides": sides, "ships": ships }))
 }
 
 async fn kills(server: &Server) -> Answer {

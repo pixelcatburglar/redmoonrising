@@ -349,7 +349,7 @@ async fn insert(db: &mut Client, account: i32, batch: &[NewBot]) -> Result<(), t
 pub async fn load(db: &Client, atlas: &Atlas, limit: usize) -> Result<(Vec<Bot>, Vec<Identity>), tokio_postgres::Error> {
     let sql = r#"SELECT b."characterID", b."role", b."homeStationID", b."share", c."stationID", c."balance",
                         c."characterName", c."corporationID", c."securityRating", c."shipID", COALESCE(e."typeID", 0),
-                        b."turf", co."allianceID"
+                        b."turf", co."allianceID", b."tier"
                    FROM "bots" b JOIN "character_" c ON c."characterID" = b."characterID"
                    LEFT JOIN entity e ON e."itemID" = c."shipID"
                    LEFT JOIN "corporation" co ON co."corporationID" = c."corporationID"
@@ -383,10 +383,16 @@ pub async fn load(db: &Client, atlas: &Atlas, limit: usize) -> Result<(Vec<Bot>,
                 activity: Activity::Docked,
                 route: Vec::new(),
                 dock_at: 0,
-                cargo: 0.0,
+                hold: Vec::new(),
                 isk: float(r, 5).unwrap_or(0.0),
+                isk_saved: float(r, 5).unwrap_or(0.0),
+                earned: 0.0,
                 pod: None,
                 turf: int(r, 11).unwrap_or(0) as i32,
+                hull: int(r, 10).unwrap_or(0) as i32,
+                tier: int(r, 13).unwrap_or(0) as u8,
+                hull_lost: false,
+                prime: super::behaviour::prime_for(int(r, 0).unwrap_or(0) as i32),
             }
         })
         .collect();

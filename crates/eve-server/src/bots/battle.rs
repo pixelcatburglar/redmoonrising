@@ -68,6 +68,8 @@ pub struct Report {
     pub touched: Vec<u32>,
     /// Bots sent home, whose ships should set off.
     pub released: Vec<u32>,
+    /// Players who fired on a bot side's tower: (side, character).
+    pub aggressors: Vec<(i32, i64)>,
 }
 
 impl Report {
@@ -75,6 +77,7 @@ impl Report {
         self.news.extend(other.news);
         self.touched.extend(other.touched);
         self.released.extend(other.released);
+        self.aggressors.extend(other.aggressors);
     }
 }
 
@@ -308,7 +311,7 @@ mod tests {
             let side = if n < 6 { ATTACKER } else { DEFENDER };
             bots.push(Bot {
                 id: 140_600_000 + n as i32, role: behaviour::Role::Ratter, home: 60_000_001, system: 30_000_009, station: 60_000_001, online: true,
-                share: 0.3, session_end: u32::MAX, activity: Activity::Docked, route: Vec::new(), dock_at: 0, cargo: 0.0, isk: 0.0, pod: None, turf: 0,
+                share: 0.3, session_end: u32::MAX, activity: Activity::Docked, route: Vec::new(), dock_at: 0, hold: Vec::new(), isk: 0.0, isk_saved: 0.0, earned: 0.0, pod: None, turf: 0, hull: 587, tier: 0, hull_lost: false, prime: 19,
             });
             ids.push(Identity { name: format!("Pilot {n}"), corp: side - 1_000_000, security: 0.0, ship: 140_700_000 + n as i64, hull: 587, alliance: Some(side) });
         }
@@ -336,7 +339,7 @@ mod tests {
             let tick = park.tick + 1;
             park.advance(tick);
             crate::fight::step(park, now, &mut crate::heartbeat::Out::default());
-            lost += park.bot_losses.iter().filter(|(_, pod)| pod.is_some()).count();
+            lost += park.bot_losses.iter().filter(|l| l.pod.is_some()).count();
             drop(w);
             presence.sync(&world, &atlas, &mut bots, &ids, &by_char, Vec::new(), &mut rng);
             let (a, d) = fight.standing(&bots, HERE);
