@@ -103,6 +103,8 @@ exit /b %errorlevel%
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# Load Windows PowerShell's checksum cmdlet even if cmd inherited PowerShell 7's module path.
+Import-Module ([IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1'))
 $Self = [IO.Path]::GetFullPath($env:RMR_LAUNCHER)
 $Root = [IO.Path]::GetDirectoryName($Self)
 $SourceRoot = $Root
@@ -619,6 +621,39 @@ function Install-PostgresRuntime([string]$Bin) {
     [IO.File]::WriteAllText((Join-Path $Bin 'vclibs-installed.ok'), '14.0.33321.0', $Utf8)
 }
 
+function Get-RmrBinutils {
+    # Rust's GNU toolchain ships dlltool but omits the assembler it runs beside itself.
+    # Use the matched portable pair so Cargo does not depend on the user's PATH.
+    $directory = Join-Path $Runtime 'tools\w64devkit-2.11.0'
+    $bin = Join-Path $directory 'w64devkit\bin'
+    $files = [ordered]@{
+        'dlltool.exe' = 'ce23d0f48c797fb36e7e4e547fffc7a4d58739d39917fab06ce2ff077b9e6ec2'
+        'as.exe' = '44b6f3bda1cae50b8774d990b1eef9d65e41637970482c2c1f2ca2be4fdcf183'
+    }
+    $invalid = @($files.Keys | Where-Object {
+        $file = Join-Path $bin $_
+        -not [IO.File]::Exists($file) -or (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $files[$_]
+    })
+    if ($invalid.Count -eq 0) { return $bin }
+
+    Set-Status 'Build tools' 'Preparing portable Windows assembler and DLL tools' 34
+    $name = 'w64devkit-x64-2.11.0.7z.exe'
+    $url = 'https://github.com/skeeto/w64devkit/releases/download/v2.11.0/' + $name
+    $archive = Get-Download $url $name '54c2bb9962e8a30c8270e34c5efc3d5fee579f53087fa7d435b95fbba2af7b2b'
+    [IO.Directory]::CreateDirectory($directory) | Out-Null
+    # Treat the release as an archive. Only extract the two tools we use.
+    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+    Set-Status 'Build tools' 'Extracting verified Windows build tools' 34
+    Invoke-Native $tar @('-xf',$archive,'-C',$directory,'w64devkit/bin/dlltool.exe','w64devkit/bin/as.exe')
+    foreach ($name in $files.Keys) {
+        $file = Join-Path $bin $name
+        if (-not [IO.File]::Exists($file) -or (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $files[$name]) {
+            throw "The portable build tool $name failed verification."
+        }
+    }
+    return $bin
+}
+
 function Start-RmrWorker {
     $lock = $null; $server = $null; $databaseOwned = $false; $exitCode = 0
     $gamePort = 26000; $webPort = 18080; $databasePort = 5432
@@ -759,8 +794,13 @@ function Start-RmrWorker {
         Install-PostgresRuntime $pgBin
         Invoke-Native (Join-Path $pgBin 'postgres.exe') @('--version')
         if ($needsBuild) {
+            $binutils = Get-RmrBinutils
             Set-Status 'Building' 'Compiling RMR; later launches reuse the verified build' 35
-            Invoke-Native $rustup @('run','1.97.0-x86_64-pc-windows-gnu','cargo','build','--release','--locked','-p','eve-server','--bins','--target','x86_64-pc-windows-gnu')
+            $previousPath = $env:Path
+            try {
+                $env:Path = $binutils + ';' + $previousPath
+                Invoke-Native $rustup @('run','1.97.0-x86_64-pc-windows-gnu','cargo','build','--release','--locked','-p','eve-server','--bins','--target','x86_64-pc-windows-gnu')
+            } finally { $env:Path = $previousPath }
             if (-not (Test-Path -LiteralPath $serverExe) -or -not (Test-Path -LiteralPath $fakeClientExe)) { throw 'The build did not produce both server and fakeclient executables.' }
             $buildRecord = [pscustomobject]@{ fingerprint = $fingerprint; serverHash = (Get-FileHash -LiteralPath $serverExe -Algorithm SHA256).Hash; clientHash = (Get-FileHash -LiteralPath $fakeClientExe -Algorithm SHA256).Hash }
             [IO.File]::WriteAllText($buildStamp, ($buildRecord | ConvertTo-Json), $Utf8)
